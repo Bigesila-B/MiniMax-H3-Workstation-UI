@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f7f9">
+  <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260822-6">
+  <title>MiniMax H3 视频工作站</title>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">H3</div>
+        <div>
+          <h1>MiniMax H3 视频工作站</h1>
+          <p>本地工作流 · TE-Speed · LoRA · AI 提示词</p>
+        </div>
+      </div>
+      <div class="connection-pill" id="connectionPill" data-state="idle">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="connectionText">尚未测试连接</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="editor-column" aria-label="视频生成参数">
+        <section class="panel connection-panel">
+          <div class="section-heading compact-heading">
+            <div>
+              <span class="eyebrow">连接设置</span>
+              <h2>ComfyUI 服务</h2>
+            </div>
+            <button class="button secondary" id="testConnectionButton" type="button">测试连接</button>
+          </div>
+          <div class="inline-form connection-form">
+            <label class="field grow-field">
+              <span>ComfyUI 地址</span>
+              <input id="comfyUrl" type="url" value="http://127.0.0.1:8188" inputmode="url" autocomplete="url" placeholder="http://127.0.0.1:8188">
+            </label>
+            <button class="button ghost scan-button" id="scanModelsButton" type="button">扫描本地模型</button>
+          </div>
+          <p class="field-help">手机访问时仍可填写 127.0.0.1，工作站服务会从电脑端代理请求，无需浏览器直接连接 ComfyUI。</p>
+        </section>
+
+        <section class="panel mode-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">生成方式</span>
+              <h2>选择视频模式</h2>
+            </div>
+          </div>
+          <div class="segmented-control" id="modeControl" role="tablist" aria-label="视频模式">
+            <button type="button" class="segment active" data-mode="t2v" role="tab" aria-selected="true">文生视频</button>
+            <button type="button" class="segment" data-mode="i2v" role="tab" aria-selected="false">图生视频</button>
+            <button type="button" class="segment" data-mode="flf2v" role="tab" aria-selected="false">首尾帧</button>
+            <button type="button" class="segment" data-mode="ref2va" role="tab" aria-selected="false">全能参考</button>
+          </div>
+
+          <div class="upload-grid hidden" id="imageUploadArea">
+            <label class="upload-card" id="firstFrameCard">
+              <input id="firstFrameInput" type="file" accept="image/png,image/jpeg,image/webp">
+              <span class="upload-icon" aria-hidden="true">+</span>
+              <strong>上传首帧</strong>
+              <small>PNG / JPG / WebP</small>
+              <img id="firstFramePreview" alt="首帧预览">
+              <button class="remove-image" id="removeFirstFrame" type="button" aria-label="移除首帧">移除</button>
+            </label>
+            <label class="upload-card hidden" id="lastFrameCard">
+              <input id="lastFrameInput" type="file" accept="image/png,image/jpeg,image/webp">
+              <span class="upload-icon" aria-hidden="true">+</span>
+              <strong>上传尾帧</strong>
+              <small>用于首尾帧过渡</small>
+              <img id="lastFramePreview" alt="尾帧预览">
+              <button class="remove-image" id="removeLastFrame" type="button" aria-label="移除尾帧">移除</button>
+            </label>
+          </div>
+
+          <div class="reference-upload-area hidden" id="referenceUploadArea">
+            <div class="reference-heading">
+              <div>
+                <strong>参考素材（可选组合）</strong>
+                <small>图片最多 9 张；视频最多 3 段；音频最多 3 段；全部参考素材合计最多 12 个。</small>
+              </div>
+              <span class="reference-limit">图片/视频至少一种 · 支持 9 图片 / 3 视频 / 3 音频 / 总数 12</span>
+            </div>
+            <div class="reference-input-grid">
+              <label class="reference-picker"><input id="referenceImagesInput" type="file" accept="image/png,image/jpeg,image/webp" multiple><strong>添加图片</strong><small>单张 ≤ 30MB</small></label>
+              <label class="reference-picker"><input id="referenceVideosInput" type="file" accept="video/mp4,video/webm,video/quicktime" multiple><strong>添加视频</strong><small>单段 ≤ 50MB</small></label>
+              <label class="reference-picker"><input id="referenceAudiosInput" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4" multiple><strong>添加音频</strong><small>单段 ≤ 15MB</small></label>
+            </div>
+            <div class="reference-file-list" id="referenceImagesList"></div>
+            <div class="reference-file-list" id="referenceVideosList"></div>
+            <div class="reference-file-list" id="referenceAudiosList"></div>
+            <p class="field-help">每个素材都会显示小预览和移除按钮。浏览器无法读取特殊编码视频时仍会保留文件，并交由 ComfyUI 解析；音频不能单独提交。</p>
+          </div>
+        </section>
+
+        <section class="panel prompt-panel">
+          <div class="section-heading prompt-heading">
+            <div>
+              <span class="eyebrow">内容描述</span>
+              <h2>视频提示词</h2>
+            </div>
+            <button class="button primary ai-generate-button" id="generateAiPromptButton" type="button">AI 生成提示词</button>
+          </div>
+          <label class="field">
+            <span>提示词或简短创意</span>
+            <textarea id="promptInput" rows="7" maxlength="12000" placeholder="可以输入简单想法，再点击 AI 生成提示词；也可以直接填写最终视频提示词。"></textarea>
+            <span class="textarea-meta"><span>AI 生成结果会直接覆盖并填入这个提示词框。</span><span id="promptCount">0 / 12000</span></span>
+          </label>
+          <div class="ai-prompt-controls">
+            <label class="field">
+              <span>AI 模型 ID</span>
+              <select id="aiModelSelect"><option value="">正在读取配置…</option></select>
+            </label>
+            <label class="field">
+              <span>提示词模板</span>
+              <select id="aiTemplateSelect"><option value="">正在读取配置…</option></select>
+            </label>
+            <label class="switch-control image-reading-switch">
+              <input id="aiReadImages" type="checkbox" checked>
+              <span class="switch-track" aria-hidden="true"></span>
+              <span><strong>读取上传图片</strong><small>开启后，AI 会同时分析已上传的首帧与尾帧。</small></span>
+            </label>
+          </div>
+          <p class="config-hint">模型 URL、API Key 和提示词模板只从工作流目录下的「AI提示词配置.json」读取，不会发送给浏览器。</p>
+        </section>
+
+        <section class="panel timing-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">时长与画面</span>
+              <h2>基础生成参数</h2>
+            </div>
+          </div>
+          <div class="settings-grid three-columns">
+            <label class="field duration-field">
+              <span>视频时长 <strong id="durationValue">5 秒</strong></span>
+              <input id="durationRange" type="range" min="1" max="15" step="1" value="5">
+              <input id="durationNumber" type="number" min="1" max="15" step="1" value="5" inputmode="numeric" aria-label="视频时长秒数">
+              <small>支持 1-15 秒；工作流会换算为 H3 支持的最近帧数。</small>
+            </label>
+            <label class="field">
+              <span>画面比例</span>
+              <select id="aspectRatio">
+                <option value="1:1 (Square)">1:1 方形</option>
+                <option value="2:3 (Portrait Photo)">2:3 竖屏</option>
+                <option value="3:2 (Photo)">3:2 横屏</option>
+                <option value="3:4 (Portrait Standard)" selected>3:4 竖屏</option>
+                <option value="4:3 (Standard)">4:3 横屏</option>
+                <option value="9:16 (Portrait Widescreen)">9:16 竖屏</option>
+                <option value="16:9 (Widescreen)">16:9 横屏</option>
+                <option value="21:9 (Ultrawide)">21:9 超宽屏</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>自定义分辨率（百万像素 MP）</span>
+              <input id="megapixels" type="number" min="0.1" max="8" step="0.05" value="0.7" inputmode="decimal">
+              <small>例如 0.7 表示约 70 万像素；实际宽高由画面比例和工作流的 32 倍数规则计算。</small>
+            </label>
+          </div>
+        </section>
+
+        <details class="panel collapsible-panel" open>
+          <summary>
+            <span><span class="eyebrow">模型管理</span><strong>MiniMax H3、VAE、CLIP 与 LoRA</strong></span>
+            <span class="summary-note" id="modelScanStatus">尚未扫描</span>
+          </summary>
+          <div class="details-content">
+            <div class="settings-grid two-columns">
+              <label class="field">
+                <span>MiniMax H3 主模型（UNET）</span>
+                <select id="unetModel"></select>
+              </label>
+              <label class="field">
+                <span>CLIP / 文本编码器</span>
+                <select id="clipModel"></select>
+              </label>
+              <label class="field">
+                <span>视频 VAE</span>
+                <select id="videoVae"></select>
+              </label>
+              <label class="field">
+                <span>音频 VAE</span>
+                <select id="audioVae"></select>
+              </label>
+            </div>
+
+            <div class="subsection-heading">
+              <div>
+                <h3>LoRA 配置</h3>
+                <p>普通模式与全能参考模式使用各自默认的 Turbo LoRA，也可扫描并添加本地 LoRA。</p>
+              </div>
+              <button class="button secondary small-button" id="addLoraButton" type="button">添加 LoRA</button>
+            </div>
+            <div class="lora-list" id="loraList"></div>
+            <p class="empty-hint hidden" id="loraEmpty">当前未启用 LoRA。TE-Speed 仍会运行，但可能失去工作流默认的 Turbo LoRA 加速效果。</p>
+          </div>
+        </details>
+
+        <details class="panel collapsible-panel">
+          <summary>
+            <span><span class="eyebrow">高级参数</span><strong>采样与 TE-Speed</strong></span>
+            <span class="summary-note">使用当前目录加速链</span>
+          </summary>
+          <div class="details-content settings-grid three-columns">
+            <label class="field">
+              <span>采样步数</span>
+              <input id="steps" type="number" min="1" max="50" value="8" inputmode="numeric">
+            </label>
+            <label class="field">
+              <span>随机种子</span>
+              <div class="input-with-button">
+                <input id="seed" type="number" min="0" value="-1" inputmode="numeric">
+                <button id="randomSeedButton" type="button" class="icon-button" title="生成随机种子">随机</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>采样器</span>
+              <input id="samplerName" type="text" value="res_multistep">
+            </label>
+            <label class="field">
+              <span>TE-Speed 控制值</span>
+              <input id="teControl" type="number" min="0" max="1" step="0.01" value="0.12">
+            </label>
+            <label class="field">
+              <span>加速区间起点</span>
+              <input id="tePercent1" type="number" min="0" max="1" step="0.05" value="0.1">
+            </label>
+            <label class="field">
+              <span>加速区间终点</span>
+              <input id="tePercent2" type="number" min="0" max="1" step="0.05" value="0.9">
+            </label>
+          </div>
+        </details>
+
+        <div class="generate-bar">
+          <div>
+            <strong id="generationSummary">文生视频 · 5 秒 · 3:4</strong>
+            <span>提交后即使网络短暂断开，也会持续恢复查询，不会误报生成失败。</span>
+          </div>
+          <button class="button primary generate-button" id="generateButton" type="button">开始生成视频</button>
+        </div>
+      </section>
+
+      <aside class="tasks-column" aria-label="生成任务">
+        <section class="panel tasks-panel">
+          <div class="section-heading compact-heading">
+            <div>
+              <span class="eyebrow">任务中心</span>
+              <h2>生成记录</h2>
+            </div>
+            <div class="task-header-actions">
+              <button class="button ghost small-button" id="refreshTasksButton" type="button">重新查询</button>
+              <button class="button danger small-button" id="clearTasksButton" type="button">清空当前任务</button>
+            </div>
+          </div>
+          <div class="task-list" id="taskList" aria-live="polite"></div>
+          <div class="empty-state" id="taskEmpty">
+            <div class="empty-visual" aria-hidden="true"></div>
+            <strong>还没有生成任务</strong>
+            <p>配置参数并提交后，进度和视频会显示在这里。</p>
+          </div>
+        </section>
+
+        <section class="panel workflow-status-panel">
+          <span class="eyebrow">工作流状态</span>
+          <h2>当前目录加速流</h2>
+          <ul class="status-list">
+            <li><span class="check-mark">✓</span><span>三个模式分别读取本地 JSON</span></li>
+            <li><span class="check-mark">✓</span><span>TE-SpeedMiniMaxH3 加速节点</span></li>
+            <li><span class="check-mark">✓</span><span>LoRA Manager 模型链</span></li>
+            <li><span class="check-mark">✓</span><span>独立 AI 提示词服务，不阻断视频生成</span></li>
+          </ul>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script type="module" src="/assets/workstation.js?v=20260823-1"></script>
+</body>
+</html>
