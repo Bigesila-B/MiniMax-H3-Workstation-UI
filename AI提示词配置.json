@@ -11,8 +11,8 @@
   "默认模板": "官方视频提示词",
   "模型": [
     {
-      "id": "agnes-2.5-flash",
-      "url": "https://api.agnes-ai.cn/v1",
+      "id": "打开AI提示词配置来修改api模型与提示词模板",
+      "url": "",
       "api_key": "",
       "supports_images": true,
       "temperature": 0.7,
