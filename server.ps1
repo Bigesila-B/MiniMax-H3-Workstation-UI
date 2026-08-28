@@ -348,6 +348,56 @@ function Get-ReferenceResolution {
     return [pscustomobject]@{ width = $width; height = $height }
 }
 
+function Resolve-ComfyModelType {
+    param([string]$ModelType)
+    switch ($ModelType) {
+        'unet' { return 'diffusion_models' }
+        'clip' { return 'text_encoders' }
+        default { return $ModelType }
+    }
+}
+
+function Get-ComfyModelNames {
+    param([string]$ComfyUrl, [string]$ModelType)
+    $comfyModelType = Resolve-ComfyModelType $ModelType
+    $remote = Invoke-Comfy 'GET' "$ComfyUrl/models/$comfyModelType"
+    if (-not $remote.Success) { throw "无法读取 ComfyUI 的 $ModelType 模型列表（HTTP $($remote.StatusCode)）。" }
+    $data = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
+    if ($data -is [System.Array]) { return @($data | ForEach-Object { [string]$_ }) }
+    if ($data.files -is [System.Array]) { return @($data.files | ForEach-Object { [string]$_ }) }
+    return @()
+}
+
+function Assert-SelectedModelsExist {
+    param($Config, [string]$ComfyUrl)
+    $required = @(
+        [pscustomobject]@{ Label = 'UNET'; Type = 'unet'; Name = [string]$Config.unet },
+        [pscustomobject]@{ Label = 'CLIP'; Type = 'clip'; Name = [string]$Config.clip },
+        [pscustomobject]@{ Label = '视频 VAE'; Type = 'vae'; Name = [string]$Config.videoVae },
+        [pscustomobject]@{ Label = '音频 VAE'; Type = 'vae'; Name = [string]$Config.audioVae }
+    )
+    $availableByType = @{}
+    foreach ($item in $required) {
+        if ([string]::IsNullOrWhiteSpace($item.Name)) { throw "未选择 $($item.Label) 模型，请重新扫描后选择。" }
+        if (-not $availableByType.ContainsKey($item.Type)) {
+            $availableByType[$item.Type] = Get-ComfyModelNames $ComfyUrl $item.Type
+        }
+        if ($availableByType[$item.Type] -notcontains $item.Name) {
+            throw "本地 ComfyUI 未找到已选 $($item.Label) 模型：$($item.Name)。请重新扫描并选择存在的模型。"
+        }
+    }
+
+    $loraNames = @($Config.loras | Where-Object { $_ -and $_.name } | ForEach-Object { [string]$_.name })
+    if ($loraNames.Count -gt 0) {
+        $availableLoras = Get-ComfyModelNames $ComfyUrl 'loras'
+        foreach ($name in $loraNames) {
+            if ($availableLoras -notcontains $name) {
+                throw "本地 ComfyUI 未找到已选 LoRA：$name。请重新扫描并移除无效 LoRA。"
+            }
+        }
+    }
+}
+
 function Get-ReferenceVideoLoader {
     param([string]$ComfyUrl)
     try {
@@ -662,6 +712,7 @@ while ($listener.IsListening) {
             $bodyText = [Text.Encoding]::UTF8.GetString($bodyBytes)
             $bodyObject = $bodyText | ConvertFrom-Json
             $comfy = Get-ComfyUrl $ctx.Request $bodyObject
+            Assert-SelectedModelsExist $bodyObject.config $comfy
             $workflow = Build-Workflow $bodyObject.config $comfy
             $payload = @{ prompt = $workflow; client_id = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Depth 100 -Compress
             $remote = Invoke-Comfy 'POST' "$comfy/prompt" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'

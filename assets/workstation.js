@@ -57,8 +57,10 @@ const state = {
   referenceVideos: [],
   referenceAudios: [],
   models: { unet: [], clip: [], vae: [], lora: [] },
+  storedModels: {},
+  modelsScanned: false,
   aiConfig: { models: [], templates: [] },
-  loras: [{ name: DEFAULT_MODELS.lora, strength: 1, active: true }],
+  loras: [],
   loraModeDefaults: true,
   tasks: [],
   pollers: new Map(),
@@ -144,8 +146,7 @@ function updateMode(mode) {
   // 仅当用户仍在使用自动默认 LoRA 时，随模式切换普通 Turbo / Ref2V 专用 4-step Turbo。
   // 一旦用户手动新增、删除、启停、改名或改强度，就保留用户配置，不再强制覆盖。
   if (state.loraModeDefaults && previousMode !== mode) {
-    const defaultLora = mode === "ref2va" ? DEFAULT_MODELS.ref2vaLora : DEFAULT_MODELS.lora;
-    state.loras = [{ name: defaultLora, strength: 1, active: true }];
+    syncAutomaticLora();
     renderLoras();
   }
   [...elements.modeControl.querySelectorAll(".segment")].forEach((button) => {
@@ -277,10 +278,29 @@ function appendOption(select, value, label = value) {
 
 function fillSelect(select, items, preferred) {
   const current = select.value || preferred;
+  const unique = [...new Set(items.filter(Boolean))];
   select.replaceChildren();
-  const unique = [...new Set([preferred, ...items].filter(Boolean))];
+
+  if (!unique.length) {
+    appendOption(select, "", "未扫描到本地模型");
+    select.disabled = true;
+    return;
+  }
+
   unique.forEach((name) => appendOption(select, name));
-  select.value = unique.includes(current) ? current : preferred;
+  select.disabled = false;
+  select.value = unique.includes(current) ? current : unique[0];
+}
+
+function getDefaultLora() {
+  const preferred = state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaLora : DEFAULT_MODELS.lora;
+  return state.models.lora.includes(preferred) ? preferred : "";
+}
+
+function syncAutomaticLora() {
+  if (!state.loraModeDefaults) return;
+  const name = getDefaultLora();
+  state.loras = name ? [{ name, strength: 1, active: true }] : [];
 }
 
 function recursivelyCollectOptions(value, result = []) {
@@ -339,22 +359,27 @@ async function scanModels() {
       } catch { return []; }
     };
     const [unetFiles, clipFiles, vaeFiles, loraFiles] = await Promise.all([
-      readModelFolder("unet"), readModelFolder("clip"), readModelFolder("vae"), readModelFolder("loras"),
+      readModelFolder("diffusion_models"), readModelFolder("text_encoders"), readModelFolder("vae"), readModelFolder("loras"),
     ]);
-    state.models.unet = [...new Set([...unetFiles, ...findNodeOptions(objectInfo, ["UNETLoader"], ["unet_name"])])];
-    state.models.clip = [...new Set([...clipFiles, ...findNodeOptions(objectInfo, ["CLIPLoader", "DualCLIPLoader"], ["clip_name", "clip_name1", "clip_name2"])])];
-    state.models.vae = [...new Set([...vaeFiles, ...findNodeOptions(objectInfo, ["VAELoader"], ["vae_name"])])];
-    state.models.lora = [...new Set([...loraFiles, ...findNodeOptions(objectInfo, ["LoraLoader", "LoraLoaderModelOnly", "Lora Loader (LoraManager)"], ["lora_name", "lora", "name"])])];
+    state.models.unet = [...new Set(unetFiles.filter(Boolean))];
+    state.models.clip = [...new Set(clipFiles.filter(Boolean))];
+    state.models.vae = [...new Set(vaeFiles.filter(Boolean))];
+    state.models.lora = [...new Set(loraFiles.filter(Boolean))];
+    state.modelsScanned = true;
 
-    fillSelect(elements.unetModel, state.models.unet, DEFAULT_MODELS.unet);
-    fillSelect(elements.clipModel, state.models.clip, DEFAULT_MODELS.clip);
-    fillSelect(elements.videoVae, state.models.vae, DEFAULT_MODELS.videoVae);
-    fillSelect(elements.audioVae, state.models.vae, DEFAULT_MODELS.audioVae);
+    fillSelect(elements.unetModel, state.models.unet, state.storedModels.unet || DEFAULT_MODELS.unet);
+    fillSelect(elements.clipModel, state.models.clip, state.storedModels.clip || DEFAULT_MODELS.clip);
+    fillSelect(elements.videoVae, state.models.vae, state.storedModels.videoVae || DEFAULT_MODELS.videoVae);
+    fillSelect(elements.audioVae, state.models.vae, state.storedModels.audioVae || DEFAULT_MODELS.audioVae);
+    state.loras = state.loraModeDefaults
+      ? []
+      : state.loras.filter((lora) => state.models.lora.includes(lora.name));
+    syncAutomaticLora();
     renderLoras();
 
     const total = state.models.unet.length + state.models.clip.length + state.models.vae.length + state.models.lora.length;
-    elements.modelScanStatus.textContent = total ? `已发现 ${total} 个候选` : "已连接，但未解析到列表";
-    toast(total ? "本地 ComfyUI 模型扫描完成。" : "ComfyUI 已响应，但部分自定义节点未公开模型列表，可继续使用工作流默认值。", total ? "success" : "");
+    elements.modelScanStatus.textContent = total ? `已发现 ${total} 个候选` : "未扫描到可用模型";
+    toast(total ? "本地 ComfyUI 模型扫描完成。" : "未扫描到可用模型，已阻止提交生成任务。", total ? "success" : "error");
     saveSettings();
   } catch (error) {
     elements.modelScanStatus.textContent = "扫描失败";
@@ -378,9 +403,9 @@ function renderLoras() {
     active.addEventListener("change", () => { state.loraModeDefaults = false; state.loras[index].active = active.checked; saveSettings(); });
 
     const select = document.createElement("select");
-    const names = [...new Set([lora.name, DEFAULT_MODELS.lora, DEFAULT_MODELS.ref2vaLora, ...state.models.lora].filter(Boolean))];
-    names.forEach((name) => appendOption(select, name));
-    select.value = lora.name;
+    state.models.lora.forEach((name) => appendOption(select, name));
+    select.value = state.models.lora.includes(lora.name) ? lora.name : state.models.lora[0] || "";
+    select.disabled = !state.models.lora.length;
     select.addEventListener("change", () => {
       state.loraModeDefaults = false;
       state.loras[index].name = select.value;
@@ -612,10 +637,10 @@ function buildGenerationConfig() {
     duration,
     aspectRatio: normalizeAspectRatio(elements.aspectRatio.value),
     megapixels: Number(elements.megapixels.value),
-    unet: state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaUnet : (elements.unetModel.value || DEFAULT_MODELS.unet),
-    clip: state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaClip : (elements.clipModel.value || DEFAULT_MODELS.clip),
-    videoVae: elements.videoVae.value || DEFAULT_MODELS.videoVae,
-    audioVae: elements.audioVae.value || DEFAULT_MODELS.audioVae,
+    unet: elements.unetModel.value,
+    clip: elements.clipModel.value,
+    videoVae: elements.videoVae.value,
+    audioVae: elements.audioVae.value,
     loras: state.loras.filter((item) => item.active !== false && item.name),
     steps: Math.max(1, Number(elements.steps.value) || 8),
     seed: seedValue < 0 || !Number.isFinite(seedValue) ? randomSeed() : normalizeSeed(seedValue),
@@ -627,7 +652,20 @@ function buildGenerationConfig() {
 }
 
 async function generate() {
+  if (!state.modelsScanned) {
+    try {
+      await scanModels();
+    } catch {}
+  }
   const config = buildGenerationConfig();
+  const requiredModels = [
+    ["UNET", config.unet],
+    ["CLIP", config.clip],
+    ["视频 VAE", config.videoVae],
+    ["音频 VAE", config.audioVae],
+  ];
+  const missingModels = requiredModels.filter(([, name]) => !name).map(([label]) => label);
+  if (missingModels.length) return toast(`请先扫描并选择可用模型：${missingModels.join("、")}。`, "error");
   if (!config.prompt) return toast("请先填写视频提示词。", "error");
   if (state.mode !== "t2v" && state.mode !== "ref2va" && !state.firstFrame) return toast("当前模式需要上传首帧图片。", "error");
   if (state.mode === "flf2v" && !state.lastFrame) return toast("首尾帧模式还需要上传尾帧图片。", "error");
@@ -1039,10 +1077,16 @@ function loadStoredState() {
     ? settings.loraModeDefaults
     : looksLikeAutomaticDefault;
 
-  fillSelect(elements.unetModel, [], settings.unet || DEFAULT_MODELS.unet);
-  fillSelect(elements.clipModel, [], settings.clip || DEFAULT_MODELS.clip);
-  fillSelect(elements.videoVae, [], settings.videoVae || DEFAULT_MODELS.videoVae);
-  fillSelect(elements.audioVae, [], settings.audioVae || DEFAULT_MODELS.audioVae);
+  state.storedModels = {
+    unet: settings.unet || "",
+    clip: settings.clip || "",
+    videoVae: settings.videoVae || "",
+    audioVae: settings.audioVae || "",
+  };
+  fillSelect(elements.unetModel, [], "");
+  fillSelect(elements.clipModel, [], "");
+  fillSelect(elements.videoVae, [], "");
+  fillSelect(elements.audioVae, [], "");
   syncDuration(settings.duration || 5);
   updateMode(settings.mode || "t2v");
   renderLoras();
@@ -1082,8 +1126,9 @@ function bindEvents() {
   elements.megapixels.addEventListener("change", saveSettings);
   [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.tePercent1, elements.tePercent2, elements.comfyUrl].forEach((element) => element.addEventListener("change", saveSettings));
   elements.addLoraButton.addEventListener("click", () => {
+    if (!state.models.lora.length) return toast("请先扫描到至少一个本地 LoRA。", "error");
     state.loraModeDefaults = false;
-    state.loras.push({ name: state.models.lora[0] || (state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaLora : DEFAULT_MODELS.lora), strength: 1, active: true });
+    state.loras.push({ name: state.models.lora[0], strength: 1, active: true });
     renderLoras();
     saveSettings();
   });
