@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260822-6">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260829-1">
   <title>MiniMax H3 视频工作站</title>
 </head>
 <body>
@@ -109,7 +109,7 @@
           <label class="field">
             <span>提示词或简短创意</span>
             <textarea id="promptInput" rows="7" maxlength="12000" placeholder="可以输入简单想法，再点击 AI 生成提示词；也可以直接填写最终视频提示词。"></textarea>
-            <span class="textarea-meta"><span>AI 生成结果会直接覆盖并填入这个提示词框。</span><span id="promptCount">0 / 12000</span></span>
+            <span class="textarea-meta"><span>AI 生成结果会直接覆盖并填入这个提示词框；模型拒答或想改输入时，点右下角「撤回」可恢复生成前的内容。</span><span class="textarea-meta-right"><button class="prompt-undo-button hidden" id="promptUndoButton" type="button" title="撤回到 AI 生成前的提示词">↩ 撤回</button><span id="promptCount">0 / 12000</span></span></span>
           </label>
           <div class="ai-prompt-controls">
             <label class="field">
@@ -123,7 +123,7 @@
             <label class="switch-control image-reading-switch">
               <input id="aiReadImages" type="checkbox" checked>
               <span class="switch-track" aria-hidden="true"></span>
-              <span><strong>读取上传图片</strong><small>开启后，AI 会同时分析已上传的首帧与尾帧。</small></span>
+              <span><strong>读取上传图片</strong><small>开启后，AI 会同时分析已上传的首帧与尾帧；全能参考模式下还会读取参考图片。</small></span>
             </label>
           </div>
           <p class="config-hint">模型 URL、API Key 和提示词模板只从工作流目录下的「AI提示词配置.json」读取，不会发送给浏览器。</p>
@@ -281,6 +281,6 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260823-1"></script>
+  <script type="module" src="/assets/workstation.js?v=20260829-5"></script>
 </body>
 </html>

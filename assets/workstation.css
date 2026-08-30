@@ -171,6 +171,20 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .field small, .field-help { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .field-help { margin: 10px 0 0; }
 .textarea-meta { display: flex; justify-content: space-between; gap: 14px; color: var(--muted); font-size: 12px; }
+.textarea-meta-right { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 9px; }
+.prompt-undo-button {
+  min-height: 26px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 3px 10px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color .16s ease, border-color .16s ease, color .16s ease;
+}
+.prompt-undo-button:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 
 .segmented-control {
   display: grid;
@@ -215,6 +229,24 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .upload-card.has-image > span, .upload-card.has-image > strong, .upload-card.has-image > small { opacity: 0; }
 .remove-image { display: none; position: absolute; right: 9px; top: 9px; z-index: 2; border: 0; border-radius: 9px; padding: 7px 9px; background: rgba(20,22,25,.72); color: white; }
 .upload-card.has-image .remove-image { display: block; }
+
+/* 拖拽上传：悬停高亮 + 页面级提示边框 */
+.upload-card.drag-over,
+.reference-picker.drag-over {
+  border-color: var(--accent);
+  border-style: solid;
+  background: var(--accent-soft);
+}
+.reference-upload-area.drag-over { border-color: var(--accent); }
+body.drag-over::after {
+  content: "";
+  position: fixed;
+  inset: 6px;
+  border: 3px dashed var(--accent);
+  border-radius: 18px;
+  pointer-events: none;
+  z-index: 40;
+}
 
 .reference-upload-area { display: grid; gap: 12px; margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface-soft); }
 .reference-heading { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }

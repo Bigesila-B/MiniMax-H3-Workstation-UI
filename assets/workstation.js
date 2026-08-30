@@ -49,6 +49,20 @@ function normalizeAspectRatio(value) {
   return ASPECT_RATIO_ALIASES[String(value || "").trim()] || "3:4 (Portrait Standard)";
 }
 
+function findModelName(list, preferredBase) {
+  // 在模型/LoRA 列表里找首选名；忽略子文件夹前缀和扩展名差异
+  // （文件被移入 "MiniMax H3" 之类的子文件夹后，旧的裸名字仍应能匹配到）。
+  const preferred = String(preferredBase || "").trim();
+  if (!preferred || !Array.isArray(list) || !list.length) return "";
+  if (list.includes(preferred)) return preferred;
+  const lowerBase = preferred.toLowerCase();
+  const matches = list.filter((name) => {
+    const file = String(name).split(/[\\/]/).pop().toLowerCase();
+    return file === lowerBase || file.startsWith(lowerBase + ".");
+  });
+  return matches[0] || "";
+}
+
 const state = {
   mode: "t2v",
   firstFrame: null,
@@ -65,6 +79,7 @@ const state = {
   tasks: [],
   pollers: new Map(),
   clockTimer: null,
+  promptUndoSnapshot: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -76,6 +91,7 @@ const elements = {
   referenceUploadArea: $("referenceUploadArea"), referenceImagesInput: $("referenceImagesInput"), referenceVideosInput: $("referenceVideosInput"), referenceAudiosInput: $("referenceAudiosInput"),
   referenceImagesList: $("referenceImagesList"), referenceVideosList: $("referenceVideosList"), referenceAudiosList: $("referenceAudiosList"),
   removeFirstFrame: $("removeFirstFrame"), removeLastFrame: $("removeLastFrame"), promptInput: $("promptInput"), promptCount: $("promptCount"),
+  promptUndoButton: $("promptUndoButton"),
   generateAiPromptButton: $("generateAiPromptButton"), aiModelSelect: $("aiModelSelect"), aiTemplateSelect: $("aiTemplateSelect"), aiReadImages: $("aiReadImages"),
   durationRange: $("durationRange"), durationNumber: $("durationNumber"), durationValue: $("durationValue"), aspectRatio: $("aspectRatio"), megapixels: $("megapixels"),
   unetModel: $("unetModel"), clipModel: $("clipModel"), videoVae: $("videoVae"), audioVae: $("audioVae"), loraList: $("loraList"), loraEmpty: $("loraEmpty"),
@@ -215,6 +231,8 @@ async function generateAiPrompt() {
   const question = elements.promptInput.value.trim();
   if (!question) return toast("请先在提示词框输入一个简短创意或要求。", "error");
   if (!elements.aiModelSelect.value || !elements.aiTemplateSelect.value) return toast("AI 模型或模板配置不可用。", "error");
+  // 撤回快照取发送前的内容，只在生成成功覆盖后生效；请求失败不会丢失当前输入。
+  const preSendText = elements.promptInput.value;
   elements.generateAiPromptButton.disabled = true;
   elements.generateAiPromptButton.textContent = "AI 正在生成…";
   try {
@@ -240,6 +258,8 @@ async function generateAiPrompt() {
     }, 180000);
     elements.promptInput.value = result.prompt || "";
     elements.promptCount.textContent = `${elements.promptInput.value.length} / 12000`;
+    state.promptUndoSnapshot = preSendText;
+    elements.promptUndoButton.classList.remove("hidden");
     const imageSourceLabel = state.mode === "ref2va" && state.referenceImages.length
       ? `，其中全能参考图片 ${state.referenceImages.length} 张`
       : "";
@@ -251,6 +271,15 @@ async function generateAiPrompt() {
     elements.generateAiPromptButton.disabled = false;
     elements.generateAiPromptButton.textContent = "AI 生成提示词";
   }
+}
+
+function undoAiPrompt() {
+  if (state.promptUndoSnapshot == null) return;
+  elements.promptInput.value = state.promptUndoSnapshot;
+  state.promptUndoSnapshot = null;
+  elements.promptUndoButton.classList.add("hidden");
+  elements.promptCount.textContent = `${elements.promptInput.value.length} / 12000`;
+  toast("已撤回到 AI 生成前的提示词内容。", "success");
 }
 
 function setImage(slot, file) {
@@ -289,12 +318,13 @@ function fillSelect(select, items, preferred) {
 
   unique.forEach((name) => appendOption(select, name));
   select.disabled = false;
-  select.value = unique.includes(current) ? current : unique[0];
+  // 当前值失效时（例如模型被移进子文件夹），优先按文件名兜底匹配首选模型。
+  select.value = unique.includes(current) ? current : (findModelName(unique, preferred) || unique[0]);
 }
 
 function getDefaultLora() {
   const preferred = state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaLora : DEFAULT_MODELS.lora;
-  return state.models.lora.includes(preferred) ? preferred : "";
+  return findModelName(state.models.lora, preferred);
 }
 
 function syncAutomaticLora() {
@@ -371,9 +401,12 @@ async function scanModels() {
     fillSelect(elements.clipModel, state.models.clip, state.storedModels.clip || DEFAULT_MODELS.clip);
     fillSelect(elements.videoVae, state.models.vae, state.storedModels.videoVae || DEFAULT_MODELS.videoVae);
     fillSelect(elements.audioVae, state.models.vae, state.storedModels.audioVae || DEFAULT_MODELS.audioVae);
+    // 扫描后把旧保存的 LoRA 名归一化成当前库里的名字（文件可能被移入了子文件夹）。
     state.loras = state.loraModeDefaults
       ? []
-      : state.loras.filter((lora) => state.models.lora.includes(lora.name));
+      : state.loras
+          .map((lora) => ({ ...lora, name: findModelName(state.models.lora, lora.name) || lora.name }))
+          .filter((lora) => state.models.lora.includes(lora.name));
     syncAutomaticLora();
     renderLoras();
 
@@ -463,8 +496,7 @@ async function uploadImage(file) {
   const form = new FormData();
   form.append("image", file, file.name);
   form.append("type", "input");
-  form.append("overwrite", "true");
-  const result = await fetchJson(apiUrl("/api/upload"), { method: "POST", body: form }, 120000);
+  form.append("overwrite", "true");  const result = await fetchJson(apiUrl("/api/upload"), { method: "POST", body: form }, 120000);
   return result.name || result.filename;
 }
 
@@ -1104,6 +1136,53 @@ function loadStoredState() {
   state.tasks.filter((task) => !["success", "failed"].includes(task.status)).forEach((task) => startPolling(task.id, true));
 }
 
+function setupDropZone(element, onFiles) {
+  if (!element) return;
+  element.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    element.classList.add("drag-over");
+  });
+  element.addEventListener("dragleave", (event) => {
+    if (!element.contains(event.relatedTarget)) element.classList.remove("drag-over");
+  });
+  element.addEventListener("drop", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    element.classList.remove("drag-over");
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length) onFiles(files);
+  });
+}
+
+function routeDroppedFiles(files) {
+  // 按当前模式把拖入的文件自动归类：全能参考按图片/视频/音频分桶，图生/首尾帧取图片。
+  if (state.mode === "ref2va") {
+    const images = files.filter((file) => file.type.startsWith("image/"));
+    const videos = files.filter((file) => file.type.startsWith("video/"));
+    const audios = files.filter((file) => file.type.startsWith("audio/"));
+    const skipped = files.length - images.length - videos.length - audios.length;
+    if (images.length) setReferenceFiles("images", images);
+    if (videos.length) setReferenceFiles("videos", videos);
+    if (audios.length) setReferenceFiles("audios", audios);
+    if (skipped) toast(`已跳过 ${skipped} 个无法识别的文件。`, "error");
+    return;
+  }
+  if (state.mode === "i2v" || state.mode === "flf2v") {
+    const images = files.filter((file) => file.type.startsWith("image/"));
+    if (!images.length) return toast("当前模式只需要图片素材，视频/音频请在全能参考模式中使用。", "error");
+    setImage("first", images[0]);
+    if (state.mode === "flf2v") {
+      if (images[1]) setImage("last", images[1]);
+      if (images.length > 2) toast("只取前两张图片作为首帧和尾帧。");
+    } else if (images.length > 1) {
+      toast("图生视频模式只使用首帧，多余图片已忽略。");
+    }
+    return;
+  }
+  toast("文生视频模式不使用素材文件；图生视频/首尾帧可拖入图片，全能参考可拖入图片、视频、音频。", "error");
+}
+
 function bindEvents() {
   elements.testConnectionButton.addEventListener("click", () => testConnection());
   elements.scanModelsButton.addEventListener("click", scanModels);
@@ -1116,6 +1195,12 @@ function bindEvents() {
   elements.removeFirstFrame.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); elements.firstFrameInput.value = ""; setImage("first", null); });
   elements.removeLastFrame.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); elements.lastFrameInput.value = ""; setImage("last", null); });
   elements.promptInput.addEventListener("input", () => { elements.promptCount.textContent = `${elements.promptInput.value.length} / 12000`; });
+  elements.promptUndoButton.addEventListener("click", (event) => {
+    // 按钮在 label 内部，阻止默认行为避免触发提示词框聚焦。
+    event.preventDefault();
+    event.stopPropagation();
+    undoAiPrompt();
+  });
   elements.generateAiPromptButton.addEventListener("click", generateAiPrompt);
   elements.aiModelSelect.addEventListener("change", saveSettings);
   elements.aiTemplateSelect.addEventListener("change", saveSettings);
@@ -1136,6 +1221,26 @@ function bindEvents() {
   elements.referenceImagesInput?.addEventListener("change", () => setReferenceFiles("images", elements.referenceImagesInput.files));
   elements.referenceVideosInput?.addEventListener("change", () => setReferenceFiles("videos", elements.referenceVideosInput.files));
   elements.referenceAudiosInput?.addEventListener("change", () => setReferenceFiles("audios", elements.referenceAudiosInput.files));
+  // 拖拽上传：素材区/首尾帧卡片可直接拖入，页面任意位置拖入也会按类型自动归类。
+  setupDropZone(elements.firstFrameCard, (files) => {
+    const image = files.find((file) => file.type.startsWith("image/"));
+    if (!image) return toast("请拖入图片文件（PNG/JPG/WebP）。", "error");
+    if (files.length > 1) toast("一次只取第一张图片作为首帧。");
+    setImage("first", image);
+  });
+  setupDropZone(elements.lastFrameCard, (files) => {
+    const image = files.find((file) => file.type.startsWith("image/"));
+    if (!image) return toast("请拖入图片文件（PNG/JPG/WebP）。", "error");
+    if (files.length > 1) toast("一次只取第一张图片作为尾帧。");
+    setImage("last", image);
+  });
+  setupDropZone(elements.referenceUploadArea, routeDroppedFiles);
+  window.addEventListener("dragover", (event) => event.preventDefault());
+  window.addEventListener("drop", (event) => {
+    event.preventDefault();
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length) routeDroppedFiles(files);
+  });
   elements.generateButton.addEventListener("click", generate);
   elements.refreshTasksButton.addEventListener("click", () => {
     const active = state.tasks.filter((task) => !["success", "failed"].includes(task.status));

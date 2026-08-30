@@ -3,6 +3,7 @@ $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $port = if ($env:WORKSTATION_PORT) { [int]$env:WORKSTATION_PORT } else { 8000 }
 Add-Type -AssemblyName System.Net.Http
+Add-Type -AssemblyName System.Drawing
 
 # 复用同一个 HTTP 客户端，避免每次轮询都创建新连接。
 $handler = New-Object System.Net.Http.HttpClientHandler
@@ -34,6 +35,65 @@ function Read-RequestBytes {
     $memory = New-Object System.IO.MemoryStream
     $Request.InputStream.CopyTo($memory)
     return $memory.ToArray()
+}
+
+function Get-RequestArray {
+    # 请求体缺少字段或值为 null 时统一返回空数组，避免 @($null) 产生单个 null 元素。
+    # 注意末尾的逗号运算符：函数输出管道会把单元素数组拆包成裸字符串，导致后续
+    # $images[0] 取到第一个字符而不是第一张图（实测单张参考图+视频时必现），必须保住数组结构。
+    param($Data, [string]$Name)
+    $property = $Data.PSObject.Properties[$Name]
+    if (-not $property -or $null -eq $property.Value) { return ,@() }
+    return ,@($property.Value | Where-Object { $_ })
+}
+
+function Repair-AiImageDataUrl {
+    # Chromium 画布（视频抽帧、参考图缩放）导出的 JPEG 带有 ICC 配置段等编码特征，
+    # base64 本身合法，但实测 agnes、部分中转站的图片解码器会报 "Non-base64 digit found"。
+    # 这里统一用 GDI+ 解码后重编码为标准 JPEG 抹平编码器差异（GDI+ 输出实测被各服务接受），
+    # 顺带前置校验 base64：坏数据直接报出具体是第几张，而不是等模型服务返回模糊错误。
+    param([string]$DataUrl, [string]$Label)
+    $marker = ';base64,'
+    $index = $DataUrl.IndexOf($marker)
+    if ($index -lt 0) { return $DataUrl }
+    $base64 = $DataUrl.Substring($index + $marker.Length)
+    if ([string]::IsNullOrWhiteSpace($base64)) { return $DataUrl }
+    try {
+        $bytes = [Convert]::FromBase64String($base64)
+    } catch {
+        throw "${Label}不是有效的 base64 数据（长度 $($base64.Length)），请刷新页面后重试。"
+    }
+    $inputStream = $null
+    $bitmap = $null
+    $outputStream = $null
+    try {
+        $inputStream = New-Object System.IO.MemoryStream(,$bytes)
+        $bitmap = [System.Drawing.Image]::FromStream($inputStream)
+        $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+            Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+        if (-not $codec) { return $DataUrl }
+        $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+        $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]88)
+        # 透明像素垫白底，避免直接编 JPEG 时透明区变黑。
+        $width = [Math]::Max(1, $bitmap.Width)
+        $height = [Math]::Max(1, $bitmap.Height)
+        $flattened = New-Object System.Drawing.Bitmap($width, $height)
+        $graphics = [System.Drawing.Graphics]::FromImage($flattened)
+        $graphics.Clear([System.Drawing.Color]::White)
+        $graphics.DrawImage($bitmap, 0, 0, $width, $height)
+        $graphics.Dispose()
+        $outputStream = New-Object System.IO.MemoryStream
+        $flattened.Save($outputStream, $codec, $encoderParams)
+        $flattened.Dispose()
+        return 'data:image/jpeg;base64,' + [Convert]::ToBase64String($outputStream.ToArray())
+    } catch {
+        # 解码或重编码失败时保留原数据，由模型服务返回原始错误。
+        return $DataUrl
+    } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+        if ($inputStream) { $inputStream.Dispose() }
+        if ($outputStream) { $outputStream.Dispose() }
+    }
 }
 
 function Get-ComfyUrl {
@@ -71,12 +131,18 @@ function Invoke-AiPrompt {
 
     $question = [string]$RequestData.question
     if ([string]::IsNullOrWhiteSpace($question)) { throw '请输入用于生成提示词的创意或要求。' }
-    $images = @($RequestData.images)
-    if (-not [bool]$model.supports_images) { $images = @() }
+
+    $images = Get-RequestArray $RequestData 'images'
+    $supportsImages = [bool]$model.supports_images
+    if (-not $supportsImages) { $images = @() }
     foreach ($image in $images) {
         $imageUrl = [string]$image
         if ($imageUrl -notmatch '^data:image/(png|jpeg|webp);base64,') { throw '图片数据格式不受支持。' }
         if ($imageUrl.Length -gt 12000000) { throw '单张图片数据过大，请压缩后重试。' }
+    }
+    # 规范化浏览器产出的图片编码（canvas JPEG 带 ICC 等特征会被部分服务拒绝），详见函数说明。
+    if ($images.Count -gt 0) {
+        $images = @(for ($i = 0; $i -lt $images.Count; $i++) { Repair-AiImageDataUrl $images[$i] "第 $($i + 1) 张图片" })
     }
 
     $retryCount = if ($null -ne $model.retry_count) { [Math]::Max(0, [Math]::Min(5, [int]$model.retry_count)) } else { 2 }
@@ -87,7 +153,7 @@ function Invoke-AiPrompt {
 
     foreach ($useImages in $attemptModes) {
         $activeImages = if ($useImages) { $images } else { @() }
-        for ($attempt = 0; $attempt -le $retryCount; $attempt++) {
+        for ($retry = 0; $retry -le $retryCount; $retry++) {
             $userContent = if ($activeImages.Count -gt 0) {
                 $parts = @([pscustomobject]@{ type = 'text'; text = $question })
                 foreach ($image in $activeImages) {
@@ -136,15 +202,15 @@ function Invoke-AiPrompt {
                 $lastError = "AI 服务返回 HTTP $statusCode"
                 if ($detail) { $lastError += "：$detail" }
                 $retryable = $statusCode -in @(408, 429, 500, 502, 503, 504)
-                if (-not $retryable -or $attempt -ge $retryCount) { break }
+                if (-not $retryable -or $retry -ge $retryCount) { break }
             } catch {
                 $lastError = $_.Exception.Message
-                if ($attempt -ge $retryCount) { break }
+                if ($retry -ge $retryCount) { break }
             } finally {
                 try { $message.Dispose() } catch {}
             }
 
-            Start-Sleep -Milliseconds ([Math]::Min(3000, 500 * [Math]::Pow(2, $attempt)))
+            Start-Sleep -Milliseconds ([Math]::Min(3000, 500 * [Math]::Pow(2, $retry)))
         }
     }
 
@@ -213,6 +279,11 @@ function Set-LoraManagerInputs {
     Set-InputValue $Workflow $NodeId 'text' ($loraText -join ' ')
     if ($loraValues.Count -gt 0) {
         Set-InputValue $Workflow $NodeId 'loras' ([pscustomobject]@{ __value__ = @($loraValues) })
+        # 部分工作流 JSON 会烘焙 lora_name 输入，LoRA 文件被移入子文件夹/重命名后会失效；
+        # 仅当节点本来就有该输入时才同步成当前选中的名字，避免给节点塞多余输入。
+        if ($loraNode.inputs.PSObject.Properties['lora_name']) {
+            Set-InputValue $Workflow $NodeId 'lora_name' $loraValues[0].name
+        }
     } elseif ($loraNode.inputs.PSObject.Properties['loras']) {
         $loraNode.inputs.PSObject.Properties.Remove('loras')
     }
@@ -459,6 +530,11 @@ function Build-ReferenceWorkflow {
     $loraText = Set-LoraManagerInputs $Workflow $loraNodeId $Config.loras
     $modelLink = if ($loraText.Count -gt 0) { @($loraNodeId, 0) } else { @($unetNode, 0) }
     Set-InputValue $Workflow $speedNode 'model' $modelLink
+    if ($loraText.Count -eq 0) {
+        # 未启用 LoRA 时模型链已绕过该节点，但 ComfyUI 仍会校验节点里烘焙的默认 LoRA 名，
+        # 文件被移入子文件夹/重命名后会直接 400，这里整个移除。
+        Remove-WorkflowNode $Workflow $loraNodeId
+    }
 
     $imageNames = @($Config.referenceImages)
     $videoNames = @($Config.referenceVideos)
@@ -589,7 +665,41 @@ function Build-Workflow {
     # 无 LoRA 时绕过 LoraManager；有 LoRA 时保留本地 JSON 的 UNET -> LoRA -> TE-Speed 加速链。
     $speedModel = if ($loraCount -gt 0) { @('105:129', 0) } else { @('105:6', 0) }
     Set-InputValue $workflow '105:122' 'model' $speedModel
+    if ($loraCount -eq 0) {
+        # 未启用 LoRA 时移除节点，避免其烘焙的默认 LoRA 名失效导致 ComfyUI 校验 400。
+        Remove-WorkflowNode $workflow '105:129'
+    }
     return $workflow
+}
+
+function Get-IpOctets {
+    param([string]$Ip)
+    $parts = $Ip.Split('.')
+    if ($parts.Count -ne 4) { return $null }
+    $octets = @()
+    foreach ($part in $parts) {
+        $value = 0
+        if (-not [int]::TryParse($part, [ref]$value) -or $value -lt 0 -or $value -gt 255) { return $null }
+        $octets += $value
+    }
+    return $octets
+}
+
+function Get-IpCategory {
+    # 区分真实局域网地址与虚拟网卡地址：Radmin/Hamachi(25/26 段)、Tailscale 等 CGNAT(100.64/10)、
+    # Clash 等代理 TUN fake-ip(198.18/15)。虚拟地址即使绑定成功，手机/其它设备通常也无法访问。
+    param([string]$Ip)
+    $octets = Get-IpOctets $Ip
+    if (-not $octets) { return 'invalid' }
+    if ($octets[0] -eq 127) { return 'loopback' }
+    if ($octets[0] -eq 169 -and $octets[1] -eq 254) { return 'linklocal' }
+    if ($octets[0] -eq 10) { return 'lan' }
+    if ($octets[0] -eq 192 -and $octets[1] -eq 168) { return 'lan' }
+    if ($octets[0] -eq 172 -and $octets[1] -ge 16 -and $octets[1] -le 31) { return 'lan' }
+    if ($octets[0] -eq 198 -and $octets[1] -ge 18 -and $octets[1] -le 19) { return 'virtual' }
+    if ($octets[0] -eq 100 -and $octets[1] -ge 64 -and $octets[1] -le 127) { return 'virtual' }
+    if ($octets[0] -eq 26 -or $octets[0] -eq 25) { return 'virtual' }
+    return 'other'
 }
 
 $listener = $null
@@ -632,15 +742,109 @@ if (-not $listener) {
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "  MiniMax H3 视频工作站 · 服务运行中" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "  本机访问:  http://127.0.0.1:$port/"
+
+# 让控制台里的地址可以直接点击打开浏览器：启用 VT 序列并输出 OSC 8 超链接。
+# 老式终端不支持时超链接序列会被忽略或自动降级为普通文本，不会出现乱码。
+$vtEnabled = $false
+try {
+    $consoleApi = Add-Type -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out int lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);
+'@ -Name 'WorkstationConsoleApi' -Namespace 'MiniMaxH3' -PassThru
+    $stdOutput = $consoleApi::GetStdHandle(-11)
+    $consoleMode = 0
+    if ($consoleApi::GetConsoleMode($stdOutput, [ref]$consoleMode)) {
+        $vtEnabled = $consoleApi::SetConsoleMode($stdOutput, $consoleMode -bor 0x0004)
+    }
+} catch { $vtEnabled = $false }
+
+function Write-ConsoleLink {
+    param([string]$Label, [string]$Url, [string]$Note, [string]$Hotkey = '')
+    $suffix = if ($Note) { "  $Note" } else { '' }
+    $keyPart = if ($Hotkey) { "[$Hotkey] " } else { '' }
+    if ($vtEnabled) {
+        $esc = [char]27
+        $link = "$esc]8;;${Url}$esc\${Url}$esc]8;;$esc\"
+        Write-Host "$Label $keyPart$link$suffix" -ForegroundColor Green
+    } else {
+        Write-Host "$Label $keyPart$Url$suffix" -ForegroundColor Green
+    }
+}
+
+# 收集地址并显示；数字编号供后台键盘监听使用。
+$linkTargets = @()
+Write-ConsoleLink '本机访问:' "http://127.0.0.1:$port/" '' '1'
+$linkTargets += [pscustomobject]@{ Key = '1'; Url = "http://127.0.0.1:$port/" }
 if ($isLan) {
+    # 默认路由所在网卡通常是唯一真实接入局域网的物理网卡，其地址排第一并标注推荐。
+    $defaultRouteIp = $null
     try {
-        Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } |
-            ForEach-Object { Write-Host "  局域网访问: http://$($_.IPAddress):$port/  (手机/其它电脑可用)" -ForegroundColor Green }
+        $defaultRoute = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+            Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
+        if ($defaultRoute) {
+            $defaultRouteIp = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $defaultRoute.InterfaceIndex -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -notlike '169.*' } |
+                Select-Object -First 1 -ExpandProperty IPAddress
+        }
+    } catch { $defaultRouteIp = $null }
+
+    $lanIps = @()
+    try {
+        $lanIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { (Get-IpCategory ([string]$_.IPAddress)) -eq 'lan' } |
+            Select-Object -ExpandProperty IPAddress)
     } catch {}
+
+    $orderedLanIps = @()
+    if ($defaultRouteIp -and $lanIps -contains $defaultRouteIp) { $orderedLanIps += $defaultRouteIp }
+    foreach ($ip in $lanIps) { if ($orderedLanIps -notcontains $ip) { $orderedLanIps += $ip } }
+    $lanKey = 2
+    foreach ($ip in $orderedLanIps) {
+        $note = if ($orderedLanIps.Count -gt 1 -and $ip -eq $orderedLanIps[0]) { '（推荐，本机所在网络）' } else { '（手机/其它电脑可用）' }
+        Write-ConsoleLink '局域网访问:' "http://${ip}:$port/" $note "$lanKey"
+        $linkTargets += [pscustomobject]@{ Key = "$lanKey"; Url = "http://${ip}:$port/" }
+        $lanKey++
+    }
+    if ($orderedLanIps.Count -eq 0) {
+        Write-Host "  未发现可直连的局域网地址；请让手机与本机连接同一 Wi-Fi/路由器网络。" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "  提示: 当前仅本机可访问。若需局域网访问，请右键以管理员身份运行启动脚本。" -ForegroundColor Yellow
 }
+if ($linkTargets.Count -gt 1) {
+    Write-Host "  提示: 按键盘数字键 1~$($linkTargets.Count) 可直接在浏览器打开对应地址。" -ForegroundColor DarkGray
+} else {
+    Write-Host "  提示: 按键盘数字键 1 可直接在浏览器打开地址。" -ForegroundColor DarkGray
+}
+
+# 经典控制台不支持可点击链接，改用后台线程监听键盘：按数字键即用默认浏览器打开地址，
+# 不干扰主 HTTP 循环；无控制台输入（如被重定向）时 ReadKey 会抛错并静默退出。
+try {
+    $keyListenerScript = {
+        param([object[]]$Targets)
+        try {
+            while ($true) {
+                $keyInfo = [Console]::ReadKey($true)
+                foreach ($target in $Targets) {
+                    if ($target.Key -eq [string]$keyInfo.KeyChar) {
+                        Start-Process -FilePath $target.Url
+                        break
+                    }
+                }
+            }
+        } catch {}
+    }
+    $keyRunspace = [runspacefactory]::CreateRunspace()
+    $keyRunspace.Open()
+    $keyPipeline = [powershell]::Create()
+    $keyPipeline.Runspace = $keyRunspace
+    $keyPipeline.AddScript($keyListenerScript).AddArgument($linkTargets) | Out-Null
+    $keyPipeline.BeginInvoke() | Out-Null
+} catch {}
 Write-Host ""
 Write-Host "  ComfyUI 请求由本服务代理，手机端无需直接访问 8188 端口。" -ForegroundColor DarkGray
 Write-Host "  关闭本窗口即停止服务。" -ForegroundColor DarkGray
@@ -749,8 +953,12 @@ while ($listener.IsListening) {
                 $debug.tePercent1 = $speed.inputs.processing_percent_1
                 $debug.tePercent2 = $speed.inputs.processing_percent_2
                 $debug.speedModel = $speed.inputs.model
-                $debug.loraText = (Get-Node $workflow '167').inputs.text
-                $debug.loraValues = (Get-Node $workflow '167').inputs.loras
+                if ($workflow.PSObject.Properties['167']) {
+                    $debug.loraText = (Get-Node $workflow '167').inputs.text
+                    $debug.loraValues = (Get-Node $workflow '167').inputs.loras
+                } else {
+                    $debug.loraText = '(未启用 LoRA，节点已移除)'
+                }
                 $debug.containsAiChatPrompt = $nodeIds -contains '165'
             } else {
                 $debug.containsAiChatPrompt = $nodeIds -contains '105:123'
@@ -759,9 +967,13 @@ while ($listener.IsListening) {
                 $debug.finalPrompt = (Get-Node $workflow '105:104').inputs.prompt
                 $debug.aspectRatio = (Get-Node $workflow '115').inputs.aspect_ratio
                 $debug.speedModel = (Get-Node $workflow '105:122').inputs.model
-                $debug.loraText = (Get-Node $workflow '105:129').inputs.text
-                $debug.loraValues = (Get-Node $workflow '105:129').inputs.loras
-                $debug.containsLoraMetadata = $null -ne (Get-Node $workflow '105:129').inputs.PSObject.Properties['loras']
+                if ($workflow.PSObject.Properties['105:129']) {
+                    $debug.loraText = (Get-Node $workflow '105:129').inputs.text
+                    $debug.loraValues = (Get-Node $workflow '105:129').inputs.loras
+                    $debug.containsLoraMetadata = $null -ne (Get-Node $workflow '105:129').inputs.PSObject.Properties['loras']
+                } else {
+                    $debug.loraText = '(未启用 LoRA，节点已移除)'
+                }
             }
             Send-Json $ctx $debug
         }
