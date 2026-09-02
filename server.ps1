@@ -486,6 +486,21 @@ function Get-ReferenceVideoLoader {
     throw '当前 ComfyUI 未提供可将视频转换为 IMAGE 帧序列的 VHS_LoadVideo 节点，暂时不能提交视频参考。请安装 VideoHelperSuite 后重试。'
 }
 
+function Test-CleanVramNodeAvailable {
+    # 「生成后自动清理显存」依赖 ComfyUI-Easy-Use 的 easy cleanGpuUsed 节点；
+    # 普通三模式工作流 JSON 内置了该节点，只有全能参考需要动态注入，注入前先探测。
+    # 沿用 Get-ReferenceVideoLoader 的做法：直接匹配原始 JSON 文本，规避超大 object_info 的解析问题。
+    param([string]$ComfyUrl)
+    try {
+        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
+        if ($remote.Success) {
+            $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
+            if ($jsonText -match '"easy cleanGpuUsed"\s*:') { return $true }
+        }
+    } catch {}
+    return $false
+}
+
 function Build-ReferenceWorkflow {
     param($Config, $Workflow, [string]$ComfyUrl)
     # 新版全能参考工作流是 API 格式，节点 ID 与旧版不同；这里集中做参数注入，UI 不需要变化。
@@ -602,6 +617,17 @@ function Build-ReferenceWorkflow {
     Remove-WorkflowNode $Workflow '165'
     Remove-WorkflowNode $Workflow '166'
 
+    # 全能参考工作流没有内置清理节点：开关开启时动态注入 easy cleanGpuUsed，
+    # 接在 CreateVideo(130) 之后，与普通三模式的内置接线一致；关闭则保持原状。
+    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
+    if ($cleanVram) {
+        if (-not (Test-CleanVramNodeAvailable $ComfyUrl)) {
+            throw '「生成后自动清理显存」需要 ComfyUI-Easy-Use 插件的 easy cleanGpuUsed 节点，当前未检测到。请确认 ComfyUI 正在运行且已安装该插件，或在高级参数里关闭这个开关。'
+        }
+        Remove-WorkflowNode $Workflow '105:130'
+        Add-WorkflowNode $Workflow ([string]$nextId) 'easy cleanGpuUsed' ([ordered]@{ anything = @('130', 0) }) | Out-Null
+    }
+
     return $Workflow
 }
 
@@ -669,6 +695,11 @@ function Build-Workflow {
         # 未启用 LoRA 时移除节点，避免其烘焙的默认 LoRA 名失效导致 ComfyUI 校验 400。
         Remove-WorkflowNode $workflow '105:129'
     }
+
+    # 「生成后自动清理显存」：普通三模式的工作流内置了 easy cleanGpuUsed（105:130，
+    # 接在 CreateVideo 之后）。开关关闭时移除；开启时保留 JSON 原状即可。
+    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
+    if (-not $cleanVram) { Remove-WorkflowNode $workflow '105:130' }
     return $workflow
 }
 
@@ -702,6 +733,257 @@ function Get-IpCategory {
     return 'other'
 }
 
+# ---------- GitHub 更新检测与一键更新 ----------
+# 仓库采用“main 分支最新提交”作为版本基准（本项目未使用 Releases）：
+# 更新配置.json 的「当前版本」记录本地对应的提交 SHA，与远端最新提交比对。
+$script:UpdateCheckCache = $null
+$script:UpdateRestartPending = $false
+
+# 更新专用 HttpClient：禁用自动重定向，每个跳转目标都要重新过一遍域名白名单。
+$updateHandler = New-Object System.Net.Http.HttpClientHandler
+$updateHandler.AllowAutoRedirect = $false
+$script:UpdateHttpClient = New-Object System.Net.Http.HttpClient($updateHandler)
+$script:UpdateHttpClient.Timeout = [TimeSpan]::FromMinutes(6)
+
+$updateRedirectStatuses = @(
+    [System.Net.HttpStatusCode]::MovedPermanently, [System.Net.HttpStatusCode]::Found,
+    [System.Net.HttpStatusCode]::SeeOther, [System.Net.HttpStatusCode]::TemporaryRedirect,
+    [System.Net.HttpStatusCode]::PermanentRedirect
+)
+
+function Test-UpdateUrlAllowed {
+    # 更新请求只允许访问 GitHub 官方域名（白名单比黑名单更严格：localhost、内网、
+    # 保留地址乃至任意其它站点都被直接拒绝）。每个重定向目标都会重新过一遍白名单。
+    param([string]$Url)
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { throw "更新服务返回了无法解析的地址：$Url" }
+    if ($uri.Scheme -ine 'https') { throw '更新功能仅允许 https 地址。' }
+    $targetHost = $uri.DnsSafeHost.ToLowerInvariant()
+    $allowedHosts = @('api.github.com', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
+    if ($allowedHosts -notcontains $targetHost -and -not $targetHost.EndsWith('.githubusercontent.com')) {
+        throw "更新功能拒绝了非 GitHub 地址：$targetHost"
+    }
+    return $uri
+}
+
+function Invoke-UpdateRequest {
+    # 禁用自动重定向，改为逐跳手动跟随并重新校验 host，防止被重定向到非 GitHub 地址。
+    param([string]$Url, [string]$Accept = $null, [int]$TimeoutMs = 20000)
+    $current = $Url
+    for ($hop = 0; $hop -le 5; $hop++) {
+        $uri = Test-UpdateUrlAllowed $current
+        $message = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $uri)
+        $message.Headers.TryAddWithoutValidation('User-Agent', 'MiniMaxH3-Workstation-Updater') | Out-Null
+        if ($Accept) { $message.Headers.TryAddWithoutValidation('Accept', $Accept) | Out-Null }
+        $cts = New-Object System.Threading.CancellationTokenSource
+        $cts.CancelAfter($TimeoutMs)
+        try {
+            $response = $script:UpdateHttpClient.SendAsync($message, $cts.Token).GetAwaiter().GetResult()
+        } catch {
+            if ($_ -is [System.Threading.Tasks.TaskCanceledException] -or $_.Exception -is [System.Threading.Tasks.TaskCanceledException]) {
+                throw '连接 GitHub 超时，请检查网络后重试。'
+            }
+            $detail = $_.Exception.Message
+            if ($_.Exception.InnerException) { $detail = $_.Exception.InnerException.Message }
+            throw "无法连接 GitHub：$detail"
+        } finally {
+            $message.Dispose()
+            $cts.Dispose()
+        }
+        if ($updateRedirectStatuses -contains $response.StatusCode) {
+            $location = $response.Headers.Location
+            $response.Dispose()
+            if (-not $location) { throw 'GitHub 返回了缺少跳转地址的重定向响应。' }
+            $current = if ($location.IsAbsoluteUri) { $location.AbsoluteUri } else { ([System.Uri]::new($uri, $location)).AbsoluteUri }
+            continue
+        }
+        return $response
+    }
+    throw 'GitHub 重定向次数过多，已中止更新请求。'
+}
+
+function Get-UpdateConfigData {
+    $configPath = Join-Path $root '更新配置.json'
+    if (-not (Test-Path $configPath -PathType Leaf)) { return $null }
+    try { return Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+}
+
+function Get-UpdateInfo {
+    param([bool]$Fresh = $false)
+    if (-not $Fresh -and $script:UpdateCheckCache -and ((Get-Date) - $script:UpdateCheckCache.At).TotalMinutes -lt 30) {
+        return $script:UpdateCheckCache.Data
+    }
+    $config = Get-UpdateConfigData
+    if (-not $config -or [string]::IsNullOrWhiteSpace([string]$config.'GitHub仓库')) {
+        return @{ configured = $false; reason = '尚未配置更新源：请在更新配置.json 的「GitHub仓库」里填写 用户名/仓库名。' }
+    }
+    $repo = ([string]$config.'GitHub仓库').Trim()
+    if ($repo -match '^https?://github\.com/([^/\s]+)/([^/\s]+?)(\.git)?/?$') { $repo = "$($Matches[1])/$($Matches[2])" }
+    if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+        return @{ configured = $false; reason = '「GitHub仓库」格式不正确，应为 用户名/仓库名。' }
+    }
+    $branch = if ([string]$config.'分支') { [string]$config.'分支' } else { 'main' }
+    if ($branch -notmatch '^[A-Za-z0-9._\-/]+$') { return @{ configured = $false; reason = '「分支」名称不合法。' } }
+
+    try {
+        $response = Invoke-UpdateRequest "https://api.github.com/repos/$repo/commits/$([Uri]::EscapeDataString($branch))" 'application/vnd.github+json' 20000
+        $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $succeeded = $response.IsSuccessStatusCode
+        $response.Dispose()
+        if (-not $succeeded) {
+            if ([int]$response.StatusCode -eq 404) { throw "GitHub 上找不到仓库 $repo（分支 $branch）。" }
+            throw "GitHub API 返回 HTTP $([int]$response.StatusCode)。"
+        }
+        $data = $text | ConvertFrom-Json
+        $latestSha = [string]$data.sha
+        if (-not $latestSha) {
+            if ($data.message) { throw "GitHub API：$($data.message)" }
+            throw 'GitHub 未返回最新提交信息。'
+        }
+        $current = [string]$config.'当前版本'
+        $commitDate = [string]$data.commit.committer.date
+        if (-not $commitDate) { $commitDate = [string]$data.commit.author.date }
+        $commitMessage = ([string]$data.commit.message -split "`r?`n")[0].Trim()
+        $result = @{
+            configured = $true
+            channel = 'commit'
+            repo = $repo
+            branch = $branch
+            currentVersion = $current
+            currentShort = if ($current.Length -ge 7) { $current.Substring(0, 7) } else { $current }
+            latestVersion = $latestSha
+            latestShort = $latestSha.Substring(0, [Math]::Min(7, $latestSha.Length))
+            latestDate = $commitDate
+            commitMessage = $commitMessage
+            commitUrl = "https://github.com/$repo/commit/$latestSha"
+            unversioned = [string]::IsNullOrWhiteSpace($current)
+            hasUpdate = ($current -and $latestSha -ine $current)
+        }
+        # 结果缓存 30 分钟，避免每次刷新页面都请求 GitHub（匿名额度 60 次/小时）。
+        $script:UpdateCheckCache = @{ At = Get-Date; Data = $result }
+        return $result
+    } catch {
+        # 检查失败不缓存：网络恢复后下一次检查应立即重试。
+        return @{ configured = $true; error = $_.Exception.Message }
+    }
+}
+
+function Invoke-ApplyUpdate {
+    # 下载 main 分支 zipball → 解压到临时目录 → 写入独立更新助手脚本（参数走 JSON，
+    # 规避中文路径的命令行转义问题）→ 响应页面 → 退出服务，由助手完成文件替换并重启。
+    $info = Get-UpdateInfo -Fresh $true
+    if ($info.error) { throw $info.error }
+    if (-not $info.configured) { throw $info.reason }
+    if (-not $info.hasUpdate) { throw '当前已经是最新版本，无需更新。' }
+
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $stamp = 'MiniMaxH3-update-' + [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
+    $workDir = Join-Path $tempRoot $stamp
+    $zipPath = Join-Path $workDir 'update.zip'
+    $extractRoot = Join-Path $workDir 'payload'
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+
+    Write-Host "  正在下载更新包（$($info.latestShort)）..." -ForegroundColor Cyan
+    $response = Invoke-UpdateRequest "https://api.github.com/repos/$($info.repo)/zipball/$($info.latestVersion)" $null 300000
+    if (-not $response.IsSuccessStatusCode) {
+        throw "下载更新包失败（HTTP $([int]$response.StatusCode)）。"
+    }
+    $contentStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $fileStream = [System.IO.File]::Create($zipPath)
+    try { $contentStream.CopyTo($fileStream) } finally {
+        $fileStream.Dispose(); $contentStream.Dispose(); $response.Dispose()
+    }
+    if ((Get-Item -LiteralPath $zipPath).Length -lt 10240) { throw '下载的更新包不完整，已中止更新。' }
+
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
+    # zipball 解压后所有内容都在“仓库名-提交”单层根目录里，先定位真实内容目录。
+    $children = @(Get-ChildItem -LiteralPath $extractRoot -Force)
+    $contentDir = if ($children.Count -eq 1 -and $children[0].PSIsContainer) { $children[0].FullName } else { $extractRoot }
+
+    $config = Get-UpdateConfigData
+    $preserve = @(@($config.'更新时保留的文件') | Where-Object { $_ } | ForEach-Object { ([string]$_) })
+    $job = @{
+        serverPid = $PID
+        targetDir = $root
+        extractDir = $contentDir
+        newVersion = [string]$info.latestVersion
+        preserve = $preserve
+    } | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText((Join-Path $workDir 'update-job.json'), $job, (New-Object System.Text.UTF8Encoding($false)))
+
+    $helperPath = Join-Path $workDir 'update-helper.ps1'
+    $helper = @'
+$ErrorActionPreference = 'Stop'
+$workDir = $PSScriptRoot
+try {
+    $job = Get-Content -LiteralPath (Join-Path $workDir 'update-job.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+
+    # 等待工作站服务退出（最多 45 秒；超时则强制结束，避免文件被占用导致替换失败）。
+    try {
+        Wait-Process -Id ([int]$job.serverPid) -Timeout 45 -ErrorAction Stop
+    } catch {
+        $stillRunning = Get-Process -Id ([int]$job.serverPid) -ErrorAction SilentlyContinue
+        if ($stillRunning) { try { Stop-Process -Id $stillRunning.Id -Force } catch {} }
+    }
+    Start-Sleep -Milliseconds 1200
+
+    # 覆盖复制新版文件：只增改、不删除本地多出的文件；保留清单中的文件本地已存在时跳过。
+    $source = [string]$job.extractDir
+    $target = [string]$job.targetDir
+    $preserve = @(@($job.preserve) | ForEach-Object { ([string]$_).TrimStart('\', '/') })
+    $copied = 0
+    $preserved = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $source -Recurse -File -Force)) {
+        $relative = $file.FullName.Substring($source.Length).TrimStart('\', '/')
+        if (-not $relative) { continue }
+        if ($preserve -contains ($relative -replace '/', '\') -and (Test-Path -LiteralPath (Join-Path $target $relative))) {
+            $preserved += $relative
+            continue
+        }
+        $destination = Join-Path $target $relative
+        $parent = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+        $copied++
+    }
+
+    # 把新版本号写回 更新配置.json，这样重启后的检查才会显示“已是最新版本”。
+    $configPath = Join-Path $target '更新配置.json'
+    if (Test-Path -LiteralPath $configPath) {
+        try {
+            $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $property = $config.PSObject.Properties['当前版本']
+            if ($property) { $property.Value = [string]$job.newVersion }
+            else { $config | Add-Member -NotePropertyName '当前版本' -NotePropertyValue ([string]$job.newVersion) }
+            $configJson = $config | ConvertTo-Json -Depth 20
+            [System.IO.File]::WriteAllText($configPath, $configJson, (New-Object System.Text.UTF8Encoding($false)))
+        } catch {}
+    }
+
+    # 重新启动工作站服务（新开一个可见的控制台窗口，与手动启动等效）。
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $target 'server.ps1')) -WorkingDirectory $target
+
+    # 延迟清理本次更新的全部临时文件后退出。
+    Start-Sleep -Seconds 6
+    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    # 更新失败：把错误留存在临时目录便于排查，并尽力把工作站服务拉起来。
+    try {
+        [System.IO.File]::WriteAllText((Join-Path $workDir 'update-error.txt'), ([string]$_), (New-Object System.Text.UTF8Encoding($true)))
+    } catch {}
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path ([string]$job.targetDir) 'server.ps1')) -WorkingDirectory ([string]$job.targetDir)
+    } catch {}
+}
+'@
+    [System.IO.File]::WriteAllText($helperPath, $helper, (New-Object System.Text.UTF8Encoding($true)))
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $helperPath) -WindowStyle Hidden
+
+    $script:UpdateRestartPending = $true
+    Write-Host "  更新包已就绪，服务即将退出，由更新助手替换文件后自动重启。" -ForegroundColor Yellow
+    Send-Json $ctx @{ ok = $true; message = "更新包下载完成，服务将自动重启并升级到 $($info.latestShort)，页面随后会自动刷新。" }
+}
+
 $listener = $null
 $isLan = $false
 $lanAddresses = @()
@@ -712,7 +994,10 @@ try {
 } catch {}
 
 # HTTP.sys 对 + 通配符需要 URL ACL；失败时改为逐个绑定本机 IPv4，避免手机请求被拦截为 Invalid Hostname。
-try {
+# 更新自动重启时旧服务刚释放端口可能有瞬时残留，这里最多重试 3 次再判定失败。
+for ($bindAttempt = 1; $bindAttempt -le 3 -and -not $listener; $bindAttempt++) {
+    if ($bindAttempt -gt 1) { Start-Sleep -Seconds 2 }
+    try {
     $l = New-Object System.Net.HttpListener
     foreach ($address in $lanAddresses) { $l.Prefixes.Add("http://${address}:$port/") }
     $l.Prefixes.Add("http://127.0.0.1:$port/")
@@ -731,6 +1016,7 @@ try {
     } catch {
         try { $l2.Stop() } catch {}
     }
+}
 }
 
 if (-not $listener) {
@@ -858,7 +1144,10 @@ $mime = @{
     '.txt'='text/plain; charset=utf-8'; '.map'='application/json; charset=utf-8'
 }
 
-while ($listener.IsListening) {
+# 让控制台窗口始终有固定标题，更新助手重启服务后标题保持一致，方便用户按说明关闭服务。
+try { $Host.UI.RawUI.WindowTitle = 'MiniMax H3 工作站服务' } catch {}
+
+while ($listener.IsListening -and -not $script:UpdateRestartPending) {
     $ctx = $listener.GetContext()
     try {
         $path = $ctx.Request.Url.AbsolutePath
@@ -887,6 +1176,16 @@ while ($listener.IsListening) {
             $stats = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
             $deviceName = $stats.devices[0].name
             Send-Json $ctx @{ ok = $true; device = if ($deviceName) { $deviceName } else { 'ComfyUI 已连接' } }
+        }
+        elseif ($path -eq '/api/check-update' -and $method -eq 'GET') {
+            $fresh = ([string]$ctx.Request.QueryString['fresh'] -eq '1')
+            $info = Get-UpdateInfo -Fresh $fresh
+            Send-Json $ctx $info
+        }
+        elseif ($path -eq '/api/apply-update' -and $method -eq 'POST') {
+            # 仅接受 application/json 请求：跨站表单无法携带该 Content-Type，阻止其它网站诱导本机执行更新。
+            if ($ctx.Request.ContentType -notmatch 'application/json') { throw '请通过页面内的一键更新按钮执行更新。' }
+            Invoke-ApplyUpdate
         }
         elseif ($path -eq '/api/object-info' -and $method -eq 'GET') {
             $comfy = Get-ComfyUrl $ctx.Request
@@ -1003,6 +1302,8 @@ while ($listener.IsListening) {
             }
             $ext = [System.IO.Path]::GetExtension($file).ToLower()
             $type = if ($mime.ContainsKey($ext)) { $mime[$ext] } else { 'application/octet-stream' }
+            # HTML 不缓存：更新替换文件后浏览器刷新必须拿到新页面（JS/CSS 由 ?v= 参数控制缓存）。
+            if ($ext -eq '.html') { $ctx.Response.Headers['Cache-Control'] = 'no-store' }
             Send-Bytes $ctx ([System.IO.File]::ReadAllBytes($file)) $type 200
         }
     } catch {
@@ -1010,4 +1311,11 @@ while ($listener.IsListening) {
     } finally {
         try { $ctx.Response.Close() } catch {}
     }
+}
+
+try { $listener.Stop() } catch {}
+if ($script:UpdateRestartPending) {
+    Write-Host ""
+    Write-Host "  工作站服务已退出，更新助手正在替换文件并重启服务，请稍候……" -ForegroundColor Cyan
+    Write-Host "  如长时间没有新窗口弹出，请重新运行「启动工作站.bat」。" -ForegroundColor DarkGray
 }

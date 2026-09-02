@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260829-1">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260902-2">
   <title>MiniMax H3 视频工作站</title>
 </head>
 <body>
@@ -19,11 +19,27 @@
           <p>本地工作流 · TE-Speed · LoRA · AI 提示词</p>
         </div>
       </div>
-      <div class="connection-pill" id="connectionPill" data-state="idle">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="connectionText">尚未测试连接</span>
+      <div class="topbar-actions">
+        <button class="button ghost small-button" id="checkUpdateButton" type="button" title="检查 GitHub 仓库上有没有新版本">检查更新</button>
+        <div class="connection-pill" id="connectionPill" data-state="idle">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connectionText">尚未测试连接</span>
+        </div>
       </div>
     </header>
+
+    <section class="update-banner hidden" id="updateBanner" data-state="idle" role="alert">
+      <span class="update-icon" aria-hidden="true">⟳</span>
+      <div class="update-text">
+        <strong id="updateTitle">发现新版本</strong>
+        <small id="updateDetail"></small>
+      </div>
+      <div class="update-actions">
+        <button class="button primary small-button" id="applyUpdateButton" type="button">一键更新</button>
+        <a class="button ghost small-button" id="updateCommitLink" href="https://github.com/Bigesila-B/MiniMax-H3-Workstation-UI/commits/main" target="_blank" rel="noopener">查看变更</a>
+        <button class="button ghost small-button" id="dismissUpdateButton" type="button">稍后</button>
+      </div>
+    </section>
 
     <main class="workspace">
       <section class="editor-column" aria-label="视频生成参数">
@@ -234,6 +250,14 @@
               <span>加速区间终点</span>
               <input id="tePercent2" type="number" min="0" max="1" step="0.05" value="0.9">
             </label>
+            <label class="switch-control vram-clean-switch">
+              <input id="cleanVram" type="checkbox" checked>
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>
+                <strong>生成后自动清理显存</strong>
+                <small>每个视频合成后执行一次「清理显存占用」（easy cleanGpuUsed），释放 GPU 缓存。关闭后连续生成不再清理，速度可能略快，但显存占用会持续增长。</small>
+              </span>
+            </label>
           </div>
         </details>
 
@@ -281,6 +305,6 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260829-5"></script>
+  <script type="module" src="/assets/workstation.js?v=20260902-2"></script>
 </body>
 </html>

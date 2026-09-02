@@ -104,6 +104,38 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .connection-pill[data-state="error"] .status-dot { background: var(--danger); }
 .connection-pill[data-state="loading"] .status-dot { background: var(--warning); animation: breathe 1.2s ease-in-out infinite; }
 
+.topbar-actions { display: flex; align-items: center; gap: 12px; }
+
+.update-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 13px;
+  margin: 0 0 18px;
+  padding: 13px 16px;
+  border: 1px solid rgba(216, 102, 63, 0.32);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  box-shadow: var(--shadow);
+}
+.update-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  border-radius: 11px;
+  background: var(--accent);
+  color: white;
+  font-size: 19px;
+  font-weight: 800;
+}
+.update-banner[data-state="updating"] .update-icon { animation: breathe 1.2s ease-in-out infinite; }
+.update-text { flex: 1; min-width: 220px; }
+.update-text strong { display: block; font-size: 15px; letter-spacing: -0.02em; }
+.update-text small { display: block; margin-top: 3px; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+.update-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1.62fr) minmax(330px, 0.78fr);
@@ -305,6 +337,17 @@ body.drag-over::after {
 .image-reading-switch > span:last-child { display: grid; gap: 3px; }
 .image-reading-switch strong { color: var(--text); font-size: 13px; }
 .image-reading-switch small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+.vram-clean-switch {
+  grid-column: 1 / -1;
+  align-items: flex-start;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+.vram-clean-switch > span:last-child { display: grid; gap: 3px; }
+.vram-clean-switch strong { color: var(--text); font-size: 13px; }
+.vram-clean-switch small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
 .config-hint { margin: 11px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
 
 .settings-grid { display: grid; gap: 15px; }

@@ -21,6 +21,9 @@ const STORAGE_KEYS = {
   tasks: "minimax-h3-workstation-tasks-v2",
 };
 
+const UPDATE_STORAGE_KEY = "minimax-h3-workstation-update-v1";
+const UPDATE_AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 自动检查最小间隔 6 小时，避免频繁请求 GitHub
+
 const ASPECT_RATIO_ALIASES = {
   "1:1": "1:1 (Square)",
   "1:1 (Square)": "1:1 (Square)",
@@ -80,6 +83,8 @@ const state = {
   pollers: new Map(),
   clockTimer: null,
   promptUndoSnapshot: null,
+  updateInfo: null,
+  updateBusy: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -96,8 +101,10 @@ const elements = {
   durationRange: $("durationRange"), durationNumber: $("durationNumber"), durationValue: $("durationValue"), aspectRatio: $("aspectRatio"), megapixels: $("megapixels"),
   unetModel: $("unetModel"), clipModel: $("clipModel"), videoVae: $("videoVae"), audioVae: $("audioVae"), loraList: $("loraList"), loraEmpty: $("loraEmpty"),
   addLoraButton: $("addLoraButton"), steps: $("steps"), seed: $("seed"), samplerName: $("samplerName"), randomSeedButton: $("randomSeedButton"),
-  teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
+  teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), cleanVram: $("cleanVram"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
   taskList: $("taskList"), taskEmpty: $("taskEmpty"), refreshTasksButton: $("refreshTasksButton"), clearTasksButton: $("clearTasksButton"), toastRegion: $("toastRegion"),
+  checkUpdateButton: $("checkUpdateButton"), updateBanner: $("updateBanner"), updateTitle: $("updateTitle"), updateDetail: $("updateDetail"),
+  applyUpdateButton: $("applyUpdateButton"), updateCommitLink: $("updateCommitLink"), dismissUpdateButton: $("dismissUpdateButton"),
 };
 
 function normalizeComfyUrl(value = elements.comfyUrl.value) {
@@ -680,6 +687,7 @@ function buildGenerationConfig() {
     teControl: Number(elements.teControl.value),
     tePercent1: Number(elements.tePercent1.value),
     tePercent2: Number(elements.tePercent2.value),
+    cleanVram: elements.cleanVram.checked,
   };
 }
 
@@ -1050,6 +1058,7 @@ function saveSettings() {
     teControl: elements.teControl.value,
     tePercent1: elements.tePercent1.value,
     tePercent2: elements.tePercent2.value,
+    cleanVram: elements.cleanVram.checked,
   };
   localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(data));
 }
@@ -1077,6 +1086,132 @@ function clearCurrentTasks() {
   toast("当前任务记录已清空。", "success");
 }
 
+function readUpdateStorage() {
+  try { return JSON.parse(localStorage.getItem(UPDATE_STORAGE_KEY) || "{}"); } catch { return {}; }
+}
+
+function writeUpdateStorage(patch) {
+  localStorage.setItem(UPDATE_STORAGE_KEY, JSON.stringify({ ...readUpdateStorage(), ...patch }));
+}
+
+function hideUpdateBanner() {
+  elements.updateBanner.classList.add("hidden");
+  elements.updateBanner.dataset.state = "idle";
+}
+
+function formatUpdateDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+}
+
+function renderUpdateBanner(force = false) {
+  const info = state.updateInfo;
+  if (!info || !info.hasUpdate) return;
+  // 自动检查时尊重用户对同一版本的“稍后”；手动点击“检查更新”则强制显示。
+  if (!force && !state.updateBusy && readUpdateStorage().dismissedVersion === info.latestVersion) return;
+  const currentPart = info.unversioned ? "本地未记录版本" : `当前 ${info.currentShort}`;
+  const message = info.commitMessage ? ` · ${info.commitMessage}` : "";
+  elements.updateTitle.textContent = `发现新版本：${info.latestShort}（${formatUpdateDate(info.latestDate)}）`;
+  elements.updateDetail.textContent = `${currentPart} · 仓库 ${info.repo}（${info.branch} 分支）${message}`;
+  elements.updateCommitLink.href = info.commitUrl;
+  elements.updateBanner.classList.remove("hidden");
+}
+
+async function checkUpdate(manual = false) {
+  if (!manual && Date.now() - Number(readUpdateStorage().lastCheckAt || 0) < UPDATE_AUTO_CHECK_INTERVAL_MS) return;
+  if (manual) {
+    elements.checkUpdateButton.disabled = true;
+    elements.checkUpdateButton.textContent = "检查中…";
+  }
+  try {
+    const info = await fetchJson(`/api/check-update${manual ? "?fresh=1" : ""}`, {}, 20000);
+    writeUpdateStorage({ lastCheckAt: Date.now() });
+    if (info.error) {
+      if (manual) toast(`检查更新失败：${info.error}`, "error");
+      return;
+    }
+    if (!info.configured) {
+      if (manual) toast(info.reason, "error");
+      return;
+    }
+    state.updateInfo = info;
+    if (info.hasUpdate) {
+      renderUpdateBanner(manual);
+    } else {
+      hideUpdateBanner();
+      if (manual) {
+        toast(info.unversioned
+          ? `已连接 GitHub；仓库最新提交为 ${info.latestShort}，但本地未记录版本号。可在更新配置.json 中把「当前版本」改为最新提交。`
+          : `已是最新版本（${info.latestShort}）。`, "success");
+      }
+    }
+  } catch (error) {
+    // 自动检查保持安静，失败不打扰；手动检查才提示。
+    if (manual) toast(`检查更新失败：${error.message}`, "error");
+  } finally {
+    if (manual) {
+      elements.checkUpdateButton.disabled = false;
+      elements.checkUpdateButton.textContent = "检查更新";
+    }
+  }
+}
+
+async function waitForServerRestart() {
+  // 服务已按请求退出，一旦 /api/check-update 能再次应答，说明新版服务已启动，刷新页面。
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 180000) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    try {
+      await fetchJson("/api/check-update", {}, 6000);
+      location.reload();
+      return;
+    } catch {}
+  }
+  toast("等待服务重启超时：请重新运行「启动工作站.bat」，再刷新页面。", "error");
+}
+
+async function applyUpdate() {
+  if (state.updateBusy) return;
+  const info = state.updateInfo;
+  if (!info || !info.hasUpdate) return;
+  const confirmed = window.confirm(
+    `将下载并应用 GitHub 上的最新版本（${info.latestShort}），工作站服务会自动重启，页面随后自动刷新。\n` +
+    "正在生成的任务保存在 ComfyUI 端，不受影响；更新会覆盖页面和工作流文件，本地的手工改动（AI提示词配置.json、更新配置.json 除外）会被替换。\n\n确定继续吗？"
+  );
+  if (!confirmed) return;
+  state.updateBusy = true;
+  elements.applyUpdateButton.disabled = true;
+  elements.updateBanner.dataset.state = "updating";
+  elements.updateTitle.textContent = "正在下载更新包…";
+  elements.updateDetail.textContent = "下载完成后工作站服务会自动重启，请勿关闭服务窗口。";
+  try {
+    const result = await fetchJson("/api/apply-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }, 330000);
+    toast(result.message || "更新包下载完成，等待服务重启…", "success");
+    elements.updateTitle.textContent = "正在等待工作站服务重启…";
+    elements.updateDetail.textContent = "服务重启后页面会自动刷新；如长时间未刷新，请重新运行「启动工作站.bat」。";
+    await waitForServerRestart();
+  } catch (error) {
+    state.updateBusy = false;
+    elements.applyUpdateButton.disabled = false;
+    elements.updateBanner.dataset.state = "idle";
+    elements.updateTitle.textContent = `发现新版本：${info.latestShort}（${formatUpdateDate(info.latestDate)}）`;
+    elements.updateDetail.textContent = `更新失败：${error.message}，可点击「一键更新」重试。`;
+    toast(`更新失败：${error.message}`, "error");
+  }
+}
+
+function dismissUpdate() {
+  const info = state.updateInfo;
+  if (info?.latestVersion) writeUpdateStorage({ dismissedVersion: info.latestVersion });
+  hideUpdateBanner();
+  toast("已忽略这个版本；待仓库出现更新的提交时会再次提醒。");
+}
+
 function loadStoredState() {
   let settings = {};
   try { settings = JSON.parse(localStorage.getItem(STORAGE_KEYS.settings) || "{}"); } catch {}
@@ -1089,6 +1224,7 @@ function loadStoredState() {
   elements.teControl.value = settings.teControl || "0.12";
   elements.tePercent1.value = settings.tePercent1 || "0.1";
   elements.tePercent2.value = settings.tePercent2 || "0.9";
+  elements.cleanVram.checked = settings.cleanVram !== false;
   state.loras = Array.isArray(settings.loras) && settings.loras.length
     ? settings.loras.map((lora) => ({
         name: lora.name,
@@ -1209,7 +1345,7 @@ function bindEvents() {
   elements.durationNumber.addEventListener("change", () => syncDuration(elements.durationNumber.value));
   elements.aspectRatio.addEventListener("change", () => { updateSummary(); saveSettings(); });
   elements.megapixels.addEventListener("change", saveSettings);
-  [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.tePercent1, elements.tePercent2, elements.comfyUrl].forEach((element) => element.addEventListener("change", saveSettings));
+  [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.tePercent1, elements.tePercent2, elements.cleanVram, elements.comfyUrl].forEach((element) => element.addEventListener("change", saveSettings));
   elements.addLoraButton.addEventListener("click", () => {
     if (!state.models.lora.length) return toast("请先扫描到至少一个本地 LoRA。", "error");
     state.loraModeDefaults = false;
@@ -1248,6 +1384,9 @@ function bindEvents() {
     if (!active.length) toast("没有需要恢复查询的任务。");
   });
   elements.clearTasksButton.addEventListener("click", clearCurrentTasks);
+  elements.checkUpdateButton.addEventListener("click", () => checkUpdate(true));
+  elements.applyUpdateButton.addEventListener("click", applyUpdate);
+  elements.dismissUpdateButton.addEventListener("click", dismissUpdate);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) state.tasks.filter((task) => !["success", "failed"].includes(task.status)).forEach((task) => queryTask(task.id));
   });
@@ -1258,3 +1397,6 @@ loadStoredState();
 startElapsedClock();
 loadAiPromptConfig();
 testConnection(false).then((connected) => { if (connected) scanModels(); });
+// 页面打开后延迟自动检查更新（6 小时节流），之后每 30 分钟补一次自动检查。
+setTimeout(() => checkUpdate(false), 2500);
+setInterval(() => checkUpdate(false), 30 * 60 * 1000);
