@@ -85,6 +85,7 @@ const state = {
   promptUndoSnapshot: null,
   updateInfo: null,
   updateBusy: false,
+  vramCleanupTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -817,6 +818,29 @@ function historyStatus(historyItem) {
   return { terminal: false, status: "running", progress: progress ?? null, message: "ComfyUI 正在生成，工作站会持续查询" };
 }
 
+function scheduleVramCleanup() {
+  // 任务结束 2 秒后、开关仍开启且队列空闲时，才调用 ComfyUI 官方清理接口——
+  // 等效于在 ComfyUI 界面手动清理显存。避免在执行中途清理破坏 comfy-aimdo
+  // 动态显存加载状态，导致下一次生成 hostbuf_file_reader_read failed。
+  if (!elements.cleanVram.checked || state.vramCleanupTimer) return;
+  state.vramCleanupTimer = setTimeout(async () => {
+    state.vramCleanupTimer = null;
+    if (!elements.cleanVram.checked) return;
+    // 还有任务在生成或排队时跳过，避免中途卸载模型拖慢下一个任务。
+    if (state.tasks.some((task) => !["success", "failed"].includes(task.status))) return;
+    try {
+      await fetchJson(apiUrl("/api/free-vram"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }, 30000);
+      toast("已自动清理显存（卸载模型并释放缓存）。", "success");
+    } catch (error) {
+      toast(`自动清理显存失败：${error.message}`, "error");
+    }
+  }, 2000);
+}
+
 async function queryTask(taskId, manual = false) {
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task || task.status === "success" || task.status === "failed") return;
@@ -852,6 +876,7 @@ async function queryTask(taskId, manual = false) {
           task.elapsedMs = Math.max(0, task.finishedAt - Number(task.startedAt || task.createdAt || task.finishedAt));
         }
         stopPolling(task.id);
+        scheduleVramCleanup();
       }
     }
   } catch (error) {

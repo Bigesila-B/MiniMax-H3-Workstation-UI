@@ -486,21 +486,6 @@ function Get-ReferenceVideoLoader {
     throw '当前 ComfyUI 未提供可将视频转换为 IMAGE 帧序列的 VHS_LoadVideo 节点，暂时不能提交视频参考。请安装 VideoHelperSuite 后重试。'
 }
 
-function Test-CleanVramNodeAvailable {
-    # 「生成后自动清理显存」依赖 ComfyUI-Easy-Use 的 easy cleanGpuUsed 节点；
-    # 普通三模式工作流 JSON 内置了该节点，只有全能参考需要动态注入，注入前先探测。
-    # 沿用 Get-ReferenceVideoLoader 的做法：直接匹配原始 JSON 文本，规避超大 object_info 的解析问题。
-    param([string]$ComfyUrl)
-    try {
-        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
-        if ($remote.Success) {
-            $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
-            if ($jsonText -match '"easy cleanGpuUsed"\s*:') { return $true }
-        }
-    } catch {}
-    return $false
-}
-
 function Build-ReferenceWorkflow {
     param($Config, $Workflow, [string]$ComfyUrl)
     # 新版全能参考工作流是 API 格式，节点 ID 与旧版不同；这里集中做参数注入，UI 不需要变化。
@@ -617,17 +602,6 @@ function Build-ReferenceWorkflow {
     Remove-WorkflowNode $Workflow '165'
     Remove-WorkflowNode $Workflow '166'
 
-    # 全能参考工作流没有内置清理节点：开关开启时动态注入 easy cleanGpuUsed，
-    # 接在 CreateVideo(130) 之后，与普通三模式的内置接线一致；关闭则保持原状。
-    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
-    if ($cleanVram) {
-        if (-not (Test-CleanVramNodeAvailable $ComfyUrl)) {
-            throw '「生成后自动清理显存」需要 ComfyUI-Easy-Use 插件的 easy cleanGpuUsed 节点，当前未检测到。请确认 ComfyUI 正在运行且已安装该插件，或在高级参数里关闭这个开关。'
-        }
-        Remove-WorkflowNode $Workflow '105:130'
-        Add-WorkflowNode $Workflow ([string]$nextId) 'easy cleanGpuUsed' ([ordered]@{ anything = @('130', 0) }) | Out-Null
-    }
-
     return $Workflow
 }
 
@@ -696,10 +670,10 @@ function Build-Workflow {
         Remove-WorkflowNode $workflow '105:129'
     }
 
-    # 「生成后自动清理显存」：普通三模式的工作流内置了 easy cleanGpuUsed（105:130，
-    # 接在 CreateVideo 之后）。开关关闭时移除；开启时保留 JSON 原状即可。
-    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
-    if (-not $cleanVram) { Remove-WorkflowNode $workflow '105:130' }
+    # 始终移除工作流内置的 easy cleanGpuUsed（105:130）：执行中途清理会破坏 comfy-aimdo
+    # 动态显存加载的页缓存状态，导致下一次生成报 hostbuf_file_reader_read failed。
+    # 「生成后自动清理显存」改由网页在任务结束后调用 /api/free-vram 等效清理（见下方端点）。
+    Remove-WorkflowNode $workflow '105:130'
     return $workflow
 }
 
@@ -1176,6 +1150,24 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             $stats = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
             $deviceName = $stats.devices[0].name
             Send-Json $ctx @{ ok = $true; device = if ($deviceName) { $deviceName } else { 'ComfyUI 已连接' } }
+        }
+        elseif ($path -eq '/api/free-vram' -and $method -eq 'POST') {
+            # 任务边界外的显存清理：转发 ComfyUI 官方 /free 接口（unload_models + free_memory），
+            # 与在 ComfyUI 界面里手动清理显存完全等效。不再使用工作流内的清理节点，规避
+            # comfy-aimdo 动态显存加载在执行中途被清理后，下一次生成 hostbuf 读取失败的问题。
+            $comfy = Get-ComfyUrl $ctx.Request
+            $payload = '{"unload_models": true, "free_memory": true}'
+            try {
+                $remote = Invoke-Comfy 'POST' "$comfy/free" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json'
+            } catch {
+                $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                $reason = ([string]$reason).TrimEnd('。', '.')
+                throw "无法连接 ComfyUI：$reason。请确认 ComfyUI 正在运行。"
+            }
+            if (-not $remote.Success) {
+                throw "ComfyUI 清理接口返回 HTTP $($remote.StatusCode)；请确认 ComfyUI 为较新版本（提供 /free 接口）。"
+            }
+            Send-Json $ctx @{ ok = $true }
         }
         elseif ($path -eq '/api/check-update' -and $method -eq 'GET') {
             $fresh = ([string]$ctx.Request.QueryString['fresh'] -eq '1')

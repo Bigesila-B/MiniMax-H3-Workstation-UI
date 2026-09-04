@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260902-2">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260903-1">
   <title>MiniMax H3 视频工作站</title>
 </head>
 <body>
@@ -255,7 +255,7 @@
               <span class="switch-track" aria-hidden="true"></span>
               <span>
                 <strong>生成后自动清理显存</strong>
-                <small>每个视频合成后执行一次「清理显存占用」（easy cleanGpuUsed），释放 GPU 缓存。关闭后连续生成不再清理，速度可能略快，但显存占用会持续增长。</small>
+                <small>每个视频生成结束且队列空闲时，自动调用 ComfyUI 官方清理接口卸载模型并释放显存——与在 ComfyUI 中手动清理等效，可避免下一次生成出现 hostbuf 读取错误。连续批量生成时自动跳过。</small>
               </span>
             </label>
           </div>
@@ -305,6 +305,6 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260902-2"></script>
+  <script type="module" src="/assets/workstation.js?v=20260903-1"></script>
 </body>
 </html>
