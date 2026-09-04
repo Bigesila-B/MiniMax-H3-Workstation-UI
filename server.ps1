@@ -1001,6 +1001,11 @@ if (-not $listener) {
 
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "  MiniMax H3 视频工作站 · 服务运行中" -ForegroundColor Cyan
+$updateVersion = $null
+try { $updateVersion = [string](Get-UpdateConfigData).'当前版本' } catch {}
+if ([string]::IsNullOrWhiteSpace($updateVersion)) { $updateVersion = '未知（更新配置.json 缺失或损坏）' }
+$versionShort = if ($updateVersion.Length -ge 7) { $updateVersion.Substring(0, 7) } else { $updateVersion }
+Write-Host "  当前版本: $versionShort" -ForegroundColor DarkGray
 Write-Host "================================================" -ForegroundColor Cyan
 
 # 让控制台里的地址可以直接点击打开浏览器：启用 VT 序列并输出 OSC 8 超链接。
