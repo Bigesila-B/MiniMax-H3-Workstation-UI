@@ -1,5 +1,6 @@
 <div align="center">
-
+有问题可以加我的QQ群：1062979770反馈，整合包三视图等等资源都在群里哦！建议使用我配置好的整合包环境使用，不然可能会在装节点和环境依赖等问题卡壳。
+  
 # 🎬 MiniMax H3 视频工作站
 
 **MiniMax H3 Workstation UI** — 面向本地 ComfyUI 的 MiniMax H3 一键视频生成工作站。
