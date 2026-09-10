@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260903-1">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260909-1">
   <title>MiniMax H3 视频工作站</title>
 </head>
 <body>
@@ -250,12 +250,30 @@
               <span>加速区间终点</span>
               <input id="tePercent2" type="number" min="0" max="1" step="0.05" value="0.9">
             </label>
+            <label class="field">
+              <span>RTX 放大倍数</span>
+              <select id="rtxUpscaleScale">
+                <option value="1">1 倍（仅画质增强）</option>
+                <option value="2" selected>2 倍</option>
+                <option value="3">3 倍</option>
+                <option value="4">4 倍</option>
+              </select>
+              <small>仅在开启下方 RTX 放大开关后生效，1-4 倍。</small>
+            </label>
             <label class="switch-control vram-clean-switch">
               <input id="cleanVram" type="checkbox" checked>
               <span class="switch-track" aria-hidden="true"></span>
               <span>
                 <strong>生成后自动清理显存</strong>
-                <small>每个视频生成结束且队列空闲时，自动调用 ComfyUI 官方清理接口卸载模型并释放显存——与在 ComfyUI 中手动清理等效，可避免下一次生成出现 hostbuf 读取错误。连续批量生成时自动跳过。</small>
+                <small>每个视频合成后执行一次「清理显存占用」（easy cleanGpuUsed），释放 GPU 缓存。关闭后连续生成不再清理，速度可能略快，但显存占用会持续增长。</small>
+              </span>
+            </label>
+            <label class="switch-control rtx-upscale-switch">
+              <input id="rtxUpscale" type="checkbox">
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>
+                <strong>RTX 视频放大（NVIDIA）</strong>
+                <small>视频合成后用 RTX Video Super Resolution 放大画面，音频保持不变。需要 RTX 显卡并安装 ComfyUI 官方 RTX Video 节点包。开启后建议把基础分辨率（百万像素）调低到 0.5 左右，速度更快、等效清晰度更高。</small>
               </span>
             </label>
           </div>
@@ -305,6 +323,6 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260903-1"></script>
+  <script type="module" src="/assets/workstation.js?v=20260909-1"></script>
 </body>
 </html>

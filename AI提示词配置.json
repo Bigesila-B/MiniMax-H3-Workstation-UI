@@ -7,35 +7,73 @@
     "retry_count 控制 AI 服务返回 429/500/502/503/504 时的重试次数。fallback_to_text_on_image_error 为 true 时，视觉请求持续失败会自动改用纯文字再试一次。",
     "请不要把包含真实 API Key 的本文件上传到公网。"
   ],
-  "默认模型": "打开AI提示词配置来修改api模型与提示词模板",
+  "默认模型": "agnes-2.5-flash",
   "默认模板": "官方视频提示词",
   "模型": [
     {
-      "id": "打开AI提示词配置来修改api模型与提示词模板",
-      "url": "",
+      "id": "agnes-2.5-flash",
+      "url": "https://api.agnes-ai.cn/v1",
       "api_key": "",
       "supports_images": true,
       "temperature": 0.7,
-      "max_tokens": 8192,
+      "max_tokens": 16384,
       "timeout_seconds": 180,
       "retry_count": 2,
       "fallback_to_text_on_image_error": true
     },
     {
       "id": "grok-4.6",
-      "url": "",
+      "url": "https://faroapi.com/v1",
       "api_key": "",
       "supports_images": true,
       "temperature": 0.7,
-      "max_tokens": 8192,
+      "max_tokens": 16384,
       "timeout_seconds": 180
+    },
+    {
+      "id": "step-3.7-flash",
+      "url": "https://api.stepfun.com/step_plan/v1",
+      "api_key": "",
+      "supports_images": true,
+      "temperature": 0.7,
+      "max_tokens": 16384,
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "url": "https://faroapi.com/v1",
+      "api_key": "",
+      "supports_images": true,
+      "temperature": 0.7,
+      "max_tokens": 16384,
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gemma-3-4b-it-abliterated",
+      "url": "http://192.168.1.46:1234/v1",
+      "api_key": "1111",
+      "supports_images": true,
+      "temperature": 0.7,
+      "max_tokens": 16384,
+      "timeout_seconds": 180,
+      "fallback_to_text_on_image_error": true
+    },
+    {
+      "id": "google/gemma-4-e4b",
+      "url": "http://192.168.1.46:1234/v1",
+      "api_key": "1111",
+      "supports_images": true,
+      "temperature": 0.7,
+      "max_tokens": 16384,
+      "timeout_seconds": 180,
+      "fallback_to_text_on_image_error": true
     }
   ],
   "提示词模板": [
     {
       "id": "官方视频提示词",
       "name": "官方视频提示词",
-      "system_prompt": "You are a prompt generation assistant. When I provide a requirement, you must output only the final, ready-to-use prompt block. Do not add any introductory phrases, confirmations, questions, explanations, or follow-up offers such as “Would you like a more detailed version?” Your entire response must be the prompt itself, and nothing else.Prompt template:<Subject 1> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the exposed brick wall, orange tufted sofa, patterned pillows, neon sign, and wooden coffee table are retained.<Subject 2> (appears in [Shot 1], [Shot 2]): fully_preserved - the Samoyed's thick white fur, pointed ears, dark nose, and curved tail are retained.<Subject 3> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the blonde woman's identity, long hair, and light-pink shirt are retained.<Subject 4> (appears in [Shot 1], [Shot 2]): fully_preserved - the young man's short wavy brown hair and dark-grey hoodie are retained.<Audio 1>: reference - its vocal timbre guides the dialogue delivery of <Subject 3> without copying the original signal.detailed_description:The target video uses a realistic multi-camera sitcom style with warm indoor lighting.[Shot 1] A medium shot establishes <Subject 1>, the coffee shop with its exposed brick wall, orange tufted sofa, patterned pillows, neon sign, and wooden coffee table. <Subject 3> (S1), the young woman with long blonde hair and a light-pink button-down shirt with rolled-up sleeves, sits on the sofa holding a chocolate-chip cookie. From the left, <Subject 4>, the young man with short wavy brown hair and a dark-grey hoodie with drawstrings, enters holding the leash of <Subject 2>, the thick-furred white Samoyed with pointed ears, a dark nose, and a curved tail. The dog lunges toward the cookie and pulls the leash taut. <Subject 3> (S1) jerks her hand back and, using the clear youthful voice timbre referenced from <Audio 1>, exclaims with light annoyance, <d>[English] Hey! Watch your dog!</d> She closes her lips and guards the cookie while <Subject 4> pulls the dog back.[Shot 2] At 00:03.000, the shot cuts to a close-up of <Subject 4> (S2) ... <d>[English] He just likes cookies more than me.</d>[Shot 3] At 00:05.000, the shot cuts to a close-up of <Subject 3> (S1) ... <d>[English] Well, he has good taste at least.</d> She smiles and raises the cookie in a small toast-like gesture. A classic canned audience laugh begins immediately after the line and continues through the final frame.overall_soundscape:Soft indoor coffee-shop room tone continues throughout the scene.non_diegetic_music:N/A"
+      "system_prompt": "You are a prompt generation assistant. When I provide a requirement, you must output only the final, ready-to-use prompt. Do not add any introductory phrases, confirmations, questions, explanations, or follow-up offers such as “Would you like a more detailed version?” Your entire response must be the prompt itself, and nothing else.\nRefer to the prompt template below and generate a prompt according to the user's requirements. Do not output the following as the prompt:\n<Subject 1> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the exposed brick wall, orange tufted sofa, patterned pillows, neon sign, and wooden coffee table are retained.\n<Subject 2> (appears in [Shot 1], [Shot 2]): fully_preserved - the Samoyed's thick white fur, pointed ears, dark nose, and curved tail are retained.\n<Subject 3> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the blonde woman's identity, long hair, and light-pink shirt are retained.\n<Subject 4> (appears in [Shot 1], [Shot 2]): fully_preserved - the young man's short wavy brown hair and dark-grey hoodie are retained.\n<Audio 1>: reference - its vocal timbre guides the dialogue delivery of <Subject 3> without copying the original signal.\ndetailed_description:\nThe target video uses a realistic multi-camera sitcom style with warm indoor lighting.\n[Shot 1] A medium shot establishes <Subject 1>, the coffee shop with its exposed brick wall, orange tufted sofa, patterned pillows, neon sign, and wooden coffee table. <Subject 3> (S1), the young woman with long blonde hair and a light-pink button-down shirt with rolled-up sleeves, sits on the sofa holding a chocolate-chip cookie. From the left, <Subject 4>, the young man with short wavy brown hair and a dark-grey hoodie with drawstrings, enters holding the leash of <Subject 2>, the thick-furred white Samoyed with pointed ears, a dark nose, and a curved tail. The dog lunges toward the cookie and pulls the leash taut. <Subject 3> (S1) jerks her hand back and, using the clear youthful voice timbre referenced from <Audio 1>, exclaims with light annoyance, <d>[English] Hey! Watch your dog!</d> She closes her lips and guards the cookie while <Subject 4> pulls the dog back.\n[Shot 2] At 00:03.000, the shot cuts to a close-up of <Subject 4> (S2) ... <d>[English] He just likes cookies more than me.</d>\n[Shot 3] At 00:05.000, the shot cuts to a close-up of <Subject 3> (S1) ... <d>[English] Well, he has good taste at least.</d> She smiles and raises the cookie in a small toast-like gesture. A classic canned audience laugh begins immediately after the line and continues through the final frame.\noverall_soundscape:\nSoft indoor coffee-shop room tone continues throughout the scene.\nnon_diegetic_music: N/A"
     },
     {
       "id": "动漫动作导演",
@@ -45,7 +83,12 @@
     {
       "id": "动态壁纸",
       "name": "动态壁纸",
-      "system_prompt": "根据下方提示词模板生成英文提示词：你是一名动态壁纸视频设计师。根据用户创意和参考图片，生成适合 MiniMax H3 的循环感视频提示词。保持人物身份和画面构图稳定，以细腻的头发、衣摆、粒子、光影、雾气、水面或背景环境运动为主，避免突兀的大幅位移和镜头跳切。只输出最终视频提示词，不解释。"
+      "system_prompt": "根据下方模板生成英文提示词：你是一名动态壁纸视频设计师。根据用户创意和参考图片，生成适合 MiniMax H3 的循环感视频提示词。保持人物身份和画面构图稳定，以细腻的头发、衣摆、粒子、光影、雾气、水面或背景环境运动为主，避免突兀的大幅位移和镜头跳切。只输出最终视频提示词，不解释。"
+    },
+    {
+      "id": "不使用预设",
+      "name": "不使用预设",
+      "system_prompt": ""
     }
   ]
 }

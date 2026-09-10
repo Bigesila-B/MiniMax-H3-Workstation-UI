@@ -371,7 +371,7 @@
         "version": 1,
         "textWidgetName": "text"
       },
-      "text": "<lora:minimax_h3_turbo_v4_step600_pruned_comfyui:0.80> <lora:minimax_h3_turbo_v4_step600_ema:1.00> <lora:minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16:1.00> <lora:minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16:1.00> <lora:minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16:1.00>",
+      "text": "<lora:minimax_h3_turbo_v4_step600_pruned_comfyui:0.80> <lora:Lora MiniMax H3 吮吸口交chasing_blowjob_minimaxh3_v1.2:1.00> <lora:Lora MiniMax H3一体多合一 HMNSFW_AIO_V2:1.00> <lora:minimax_h3_turbo_v4_step600_ema:1.00> <lora:minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16:1.00> <lora:minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16:1.00> <lora:minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16:1.00>",
       "loras": {
         "__value__": [
           {
@@ -380,6 +380,24 @@
             "active": false,
             "expanded": false,
             "clipStrength": "0.80",
+            "selected": false,
+            "locked": false
+          },
+          {
+            "name": "Lora MiniMax H3 吮吸口交chasing_blowjob_minimaxh3_v1.2",
+            "strength": 1,
+            "active": false,
+            "expanded": false,
+            "clipStrength": 1,
+            "selected": false,
+            "locked": false
+          },
+          {
+            "name": "Lora MiniMax H3一体多合一 HMNSFW_AIO_V2",
+            "strength": 1,
+            "active": false,
+            "expanded": false,
+            "clipStrength": 1,
             "selected": false,
             "locked": false
           },

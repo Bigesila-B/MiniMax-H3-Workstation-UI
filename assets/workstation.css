@@ -348,6 +348,17 @@ body.drag-over::after {
 .vram-clean-switch > span:last-child { display: grid; gap: 3px; }
 .vram-clean-switch strong { color: var(--text); font-size: 13px; }
 .vram-clean-switch small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+.rtx-upscale-switch {
+  grid-column: 1 / -1;
+  align-items: flex-start;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+.rtx-upscale-switch > span:last-child { display: grid; gap: 3px; }
+.rtx-upscale-switch strong { color: var(--text); font-size: 13px; }
+.rtx-upscale-switch small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
 .config-hint { margin: 11px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
 
 .settings-grid { display: grid; gap: 15px; }

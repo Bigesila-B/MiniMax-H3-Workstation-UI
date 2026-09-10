@@ -85,7 +85,6 @@ const state = {
   promptUndoSnapshot: null,
   updateInfo: null,
   updateBusy: false,
-  vramCleanupTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -102,7 +101,8 @@ const elements = {
   durationRange: $("durationRange"), durationNumber: $("durationNumber"), durationValue: $("durationValue"), aspectRatio: $("aspectRatio"), megapixels: $("megapixels"),
   unetModel: $("unetModel"), clipModel: $("clipModel"), videoVae: $("videoVae"), audioVae: $("audioVae"), loraList: $("loraList"), loraEmpty: $("loraEmpty"),
   addLoraButton: $("addLoraButton"), steps: $("steps"), seed: $("seed"), samplerName: $("samplerName"), randomSeedButton: $("randomSeedButton"),
-  teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), cleanVram: $("cleanVram"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
+  teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), cleanVram: $("cleanVram"),
+  rtxUpscale: $("rtxUpscale"), rtxUpscaleScale: $("rtxUpscaleScale"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
   taskList: $("taskList"), taskEmpty: $("taskEmpty"), refreshTasksButton: $("refreshTasksButton"), clearTasksButton: $("clearTasksButton"), toastRegion: $("toastRegion"),
   checkUpdateButton: $("checkUpdateButton"), updateBanner: $("updateBanner"), updateTitle: $("updateTitle"), updateDetail: $("updateDetail"),
   applyUpdateButton: $("applyUpdateButton"), updateCommitLink: $("updateCommitLink"), dismissUpdateButton: $("dismissUpdateButton"),
@@ -689,6 +689,8 @@ function buildGenerationConfig() {
     tePercent1: Number(elements.tePercent1.value),
     tePercent2: Number(elements.tePercent2.value),
     cleanVram: elements.cleanVram.checked,
+    rtxUpscale: elements.rtxUpscale.checked,
+    rtxUpscaleScale: Math.max(1, Math.min(4, Math.round(Number(elements.rtxUpscaleScale.value) || 2))),
   };
 }
 
@@ -818,29 +820,6 @@ function historyStatus(historyItem) {
   return { terminal: false, status: "running", progress: progress ?? null, message: "ComfyUI 正在生成，工作站会持续查询" };
 }
 
-function scheduleVramCleanup() {
-  // 任务结束 2 秒后、开关仍开启且队列空闲时，才调用 ComfyUI 官方清理接口——
-  // 等效于在 ComfyUI 界面手动清理显存。避免在执行中途清理破坏 comfy-aimdo
-  // 动态显存加载状态，导致下一次生成 hostbuf_file_reader_read failed。
-  if (!elements.cleanVram.checked || state.vramCleanupTimer) return;
-  state.vramCleanupTimer = setTimeout(async () => {
-    state.vramCleanupTimer = null;
-    if (!elements.cleanVram.checked) return;
-    // 还有任务在生成或排队时跳过，避免中途卸载模型拖慢下一个任务。
-    if (state.tasks.some((task) => !["success", "failed"].includes(task.status))) return;
-    try {
-      await fetchJson(apiUrl("/api/free-vram"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      }, 30000);
-      toast("已自动清理显存（卸载模型并释放缓存）。", "success");
-    } catch (error) {
-      toast(`自动清理显存失败：${error.message}`, "error");
-    }
-  }, 2000);
-}
-
 async function queryTask(taskId, manual = false) {
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task || task.status === "success" || task.status === "failed") return;
@@ -876,7 +855,6 @@ async function queryTask(taskId, manual = false) {
           task.elapsedMs = Math.max(0, task.finishedAt - Number(task.startedAt || task.createdAt || task.finishedAt));
         }
         stopPolling(task.id);
-        scheduleVramCleanup();
       }
     }
   } catch (error) {
@@ -1084,6 +1062,8 @@ function saveSettings() {
     tePercent1: elements.tePercent1.value,
     tePercent2: elements.tePercent2.value,
     cleanVram: elements.cleanVram.checked,
+    rtxUpscale: elements.rtxUpscale.checked,
+    rtxUpscaleScale: elements.rtxUpscaleScale.value,
   };
   localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(data));
 }
@@ -1250,6 +1230,8 @@ function loadStoredState() {
   elements.tePercent1.value = settings.tePercent1 || "0.1";
   elements.tePercent2.value = settings.tePercent2 || "0.9";
   elements.cleanVram.checked = settings.cleanVram !== false;
+  elements.rtxUpscale.checked = settings.rtxUpscale === true;
+  elements.rtxUpscaleScale.value = ["1", "2", "3", "4"].includes(String(settings.rtxUpscaleScale)) ? String(settings.rtxUpscaleScale) : "2";
   state.loras = Array.isArray(settings.loras) && settings.loras.length
     ? settings.loras.map((lora) => ({
         name: lora.name,
@@ -1370,7 +1352,7 @@ function bindEvents() {
   elements.durationNumber.addEventListener("change", () => syncDuration(elements.durationNumber.value));
   elements.aspectRatio.addEventListener("change", () => { updateSummary(); saveSettings(); });
   elements.megapixels.addEventListener("change", saveSettings);
-  [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.tePercent1, elements.tePercent2, elements.cleanVram, elements.comfyUrl].forEach((element) => element.addEventListener("change", saveSettings));
+  [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.tePercent1, elements.tePercent2, elements.cleanVram, elements.rtxUpscale, elements.rtxUpscaleScale, elements.comfyUrl].forEach((element) => element.addEventListener("change", saveSettings));
   elements.addLoraButton.addEventListener("click", () => {
     if (!state.models.lora.length) return toast("请先扫描到至少一个本地 LoRA。", "error");
     state.loraModeDefaults = false;

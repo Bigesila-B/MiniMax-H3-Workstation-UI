@@ -486,6 +486,73 @@ function Get-ReferenceVideoLoader {
     throw '当前 ComfyUI 未提供可将视频转换为 IMAGE 帧序列的 VHS_LoadVideo 节点，暂时不能提交视频参考。请安装 VideoHelperSuite 后重试。'
 }
 
+function Test-CleanVramNodeAvailable {
+    # 「生成后自动清理显存」依赖 ComfyUI-Easy-Use 的 easy cleanGpuUsed 节点；
+    # 普通三模式工作流 JSON 内置了该节点，只有全能参考需要动态注入，注入前先探测。
+    # 沿用 Get-ReferenceVideoLoader 的做法：直接匹配原始 JSON 文本，规避超大 object_info 的解析问题。
+    param([string]$ComfyUrl)
+    try {
+        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
+        if ($remote.Success) {
+            $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
+            if ($jsonText -match '"easy cleanGpuUsed"\s*:') { return $true }
+        }
+    } catch {}
+    return $false
+}
+
+function Test-RtxUpscaleNodeAvailable {
+    # 「RTX 视频放大」依赖 NVIDIA RTX Video 官方节点包的 RTXVideoSuperResolution 节点。
+    # 沿用 Test-CleanVramNodeAvailable 的做法：匹配 object_info 原始文本，规避超大响应的解析成本。
+    param([string]$ComfyUrl)
+    try {
+        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
+        if ($remote.Success) {
+            $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
+            if ($jsonText -match '"RTXVideoSuperResolution"\s*:') { return $true }
+        }
+    } catch {}
+    return $false
+}
+
+function Get-RtxScaleValue {
+    # 放大倍数限制为 1-4 的整数（1 倍不改变分辨率、仅走 RTX 画质增强），异常输入回退默认 2 倍。
+    param($RawValue)
+    $scale = 2
+    try { if ($null -ne $RawValue) { $scale = [int][Math]::Round([double]$RawValue) } } catch {}
+    return [Math]::Max(1, [Math]::Min(4, $scale))
+}
+
+function Add-RtxUpscaleChain {
+    # 在输出端接入 RTX 放大链（只做后处理，不碰采样链）：
+    # 源视频 -> GetVideoComponents（拆出图像帧/音频/fps/位深/色彩空间）
+    # -> RTXVideoSuperResolution（只放大图像帧）-> CreateVideo（用原参数与原音频重新合成）。
+    # 返回新 CreateVideo 的节点 ID，由调用方把保存节点的 video 输入改接到它。
+    param($Workflow, [string]$SourceNodeId, [double]$Scale, [int]$StartId)
+    $ids = @()
+    $candidate = $StartId
+    while ($ids.Count -lt 3) {
+        $name = [string]$candidate
+        if (-not $Workflow.PSObject.Properties[$name]) { $ids += $name }
+        $candidate++
+    }
+    Add-WorkflowNode $Workflow $ids[0] 'GetVideoComponents' ([ordered]@{ video = @($SourceNodeId, 0) }) | Out-Null
+    Add-WorkflowNode $Workflow $ids[1] 'RTXVideoSuperResolution' ([ordered]@{
+        resize_type = 'scale by multiplier'
+        'resize_type.scale' = $Scale
+        quality = 'ULTRA'
+        images = @($ids[0], 0)
+    }) | Out-Null
+    Add-WorkflowNode $Workflow $ids[2] 'CreateVideo' ([ordered]@{
+        fps = @($ids[0], 2)
+        bit_depth = @($ids[0], 3)
+        color_space = @($ids[0], 4)
+        images = @($ids[1], 0)
+        audio = @($ids[0], 1)
+    }) | Out-Null
+    return $ids[2]
+}
+
 function Build-ReferenceWorkflow {
     param($Config, $Workflow, [string]$ComfyUrl)
     # 新版全能参考工作流是 API 格式，节点 ID 与旧版不同；这里集中做参数注入，UI 不需要变化。
@@ -602,6 +669,29 @@ function Build-ReferenceWorkflow {
     Remove-WorkflowNode $Workflow '165'
     Remove-WorkflowNode $Workflow '166'
 
+    # 全能参考工作流没有内置清理节点：开关开启时动态注入 easy cleanGpuUsed，
+    # 接在 CreateVideo(130) 之后，与普通三模式的内置接线一致；关闭则保持原状。
+    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
+    # 保存节点(172)固定接在 CreateVideo(130) 上；显存清理与 RTX 放大依次插在两者之间。
+    $saveSource = '130'
+    if ($cleanVram) {
+        if (-not (Test-CleanVramNodeAvailable $ComfyUrl)) {
+            throw '「生成后自动清理显存」需要 ComfyUI-Easy-Use 插件的 easy cleanGpuUsed 节点，当前未检测到。请确认 ComfyUI 正在运行且已安装该插件，或在高级参数里关闭这个开关。'
+        }
+        Remove-WorkflowNode $Workflow '105:130'
+        Add-WorkflowNode $Workflow ([string]$nextId) 'easy cleanGpuUsed' ([ordered]@{ anything = @('130', 0) }) | Out-Null
+        $saveSource = [string]$nextId
+        $nextId++
+    }
+    $rtxScale = Get-RtxScaleValue $Config.rtxUpscaleScale
+    if ($Config.rtxUpscale) {
+        if (-not (Test-RtxUpscaleNodeAvailable $ComfyUrl)) {
+            throw '「RTX 视频放大」需要 NVIDIA RTX Video 官方节点包的 RTXVideoSuperResolution 节点，当前未检测到。请安装该节点包后重启 ComfyUI，或关闭放大开关。'
+        }
+        $videoOut = Add-RtxUpscaleChain $Workflow $saveSource $rtxScale $nextId
+        Set-InputValue $Workflow '172' 'video' @($videoOut, 0)
+    }
+
     return $Workflow
 }
 
@@ -670,10 +760,28 @@ function Build-Workflow {
         Remove-WorkflowNode $workflow '105:129'
     }
 
-    # 始终移除工作流内置的 easy cleanGpuUsed（105:130）：执行中途清理会破坏 comfy-aimdo
-    # 动态显存加载的页缓存状态，导致下一次生成报 hostbuf_file_reader_read failed。
-    # 「生成后自动清理显存」改由网页在任务结束后调用 /api/free-vram 等效清理（见下方端点）。
-    Remove-WorkflowNode $workflow '105:130'
+    # 「生成后自动清理显存」：普通三模式的工作流内置了 easy cleanGpuUsed（105:130，
+    # 接在 CreateVideo 之后）。开关关闭时移除该节点，并把保存节点直接接回 CreateVideo，
+    # 避免 92 悬空指向已删除的节点。
+    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
+    # RTX 放大链从保存节点的当前源头接入：开启清理时源为清理节点，关闭时为 CreateVideo。
+    $saveSource = if ($cleanVram) { '105:130' } else { '105:91' }
+    if (-not $cleanVram) {
+        Remove-WorkflowNode $workflow '105:130'
+        Set-InputValue $workflow '92' 'video' @('105:91', 0)
+    }
+    $rtxScale = Get-RtxScaleValue $Config.rtxUpscaleScale
+    if ($Config.rtxUpscale) {
+        if (-not (Test-RtxUpscaleNodeAvailable $ComfyUrl)) {
+            throw '「RTX 视频放大」需要 NVIDIA RTX Video 官方节点包的 RTXVideoSuperResolution 节点，当前未检测到。请安装该节点包后重启 ComfyUI，或关闭放大开关。'
+        }
+        $nextId = 1000
+        foreach ($property in $workflow.PSObject.Properties) {
+            try { $nextId = [Math]::Max($nextId, [int]$property.Name + 1) } catch {}
+        }
+        $videoOut = Add-RtxUpscaleChain $workflow $saveSource $rtxScale $nextId
+        Set-InputValue $workflow '92' 'video' @($videoOut, 0)
+    }
     return $workflow
 }
 
@@ -1001,11 +1109,6 @@ if (-not $listener) {
 
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "  MiniMax H3 视频工作站 · 服务运行中" -ForegroundColor Cyan
-$updateVersion = $null
-try { $updateVersion = [string](Get-UpdateConfigData).'当前版本' } catch {}
-if ([string]::IsNullOrWhiteSpace($updateVersion)) { $updateVersion = '未知（更新配置.json 缺失或损坏）' }
-$versionShort = if ($updateVersion.Length -ge 7) { $updateVersion.Substring(0, 7) } else { $updateVersion }
-Write-Host "  当前版本: $versionShort" -ForegroundColor DarkGray
 Write-Host "================================================" -ForegroundColor Cyan
 
 # 让控制台里的地址可以直接点击打开浏览器：启用 VT 序列并输出 OSC 8 超链接。
@@ -1155,24 +1258,6 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             $stats = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
             $deviceName = $stats.devices[0].name
             Send-Json $ctx @{ ok = $true; device = if ($deviceName) { $deviceName } else { 'ComfyUI 已连接' } }
-        }
-        elseif ($path -eq '/api/free-vram' -and $method -eq 'POST') {
-            # 任务边界外的显存清理：转发 ComfyUI 官方 /free 接口（unload_models + free_memory），
-            # 与在 ComfyUI 界面里手动清理显存完全等效。不再使用工作流内的清理节点，规避
-            # comfy-aimdo 动态显存加载在执行中途被清理后，下一次生成 hostbuf 读取失败的问题。
-            $comfy = Get-ComfyUrl $ctx.Request
-            $payload = '{"unload_models": true, "free_memory": true}'
-            try {
-                $remote = Invoke-Comfy 'POST' "$comfy/free" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json'
-            } catch {
-                $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                $reason = ([string]$reason).TrimEnd('。', '.')
-                throw "无法连接 ComfyUI：$reason。请确认 ComfyUI 正在运行。"
-            }
-            if (-not $remote.Success) {
-                throw "ComfyUI 清理接口返回 HTTP $($remote.StatusCode)；请确认 ComfyUI 为较新版本（提供 /free 接口）。"
-            }
-            Send-Json $ctx @{ ok = $true }
         }
         elseif ($path -eq '/api/check-update' -and $method -eq 'GET') {
             $fresh = ([string]$ctx.Request.QueryString['fresh'] -eq '1')
