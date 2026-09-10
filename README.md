@@ -15,7 +15,6 @@
 
 <div align="center">
   <img src="desktop-workstation-preview.png" alt="MiniMax H3 视频工作站 · 桌面端" width="430">
-  <img src="workstation-ai-prompt-mobile.png" alt="MiniMax H3 视频工作站 · 移动端" width="200">
 </div>
 
 <div align="center"><em>左：桌面端（模型管理 / TE-Speed / 任务中心） · 右：移动端 AI 提示词界面</em></div>
