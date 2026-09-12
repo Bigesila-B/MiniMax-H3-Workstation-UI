@@ -30,6 +30,10 @@ if ($env:WORKSTATION_ALLOW_COMFY_HOSTS) {
 # ComfyUI 节点能力缓存（键为 ComfyUI 地址），避免每次生成都重新拉一遍 /object_info。
 $script:CapabilityCache = @{}
 
+# RTX 超分「真实可用性」探测缓存（键为 ComfyUI 地址）。
+# 与 CapabilityCache 分开：前者回答"节点在不在"，这里回答"节点跑不跑得起来"。
+$script:RtxVfxCache = @{}
+
 # 本次构建产生的降级提示（例如缺少 RTX 节点而跳过放大）。每次构建前清空，构建后随响应回给网页。
 $script:BuildWarnings = @()
 
@@ -891,6 +895,108 @@ function Get-RtxScaleValue {
     return [Math]::Max(1, [Math]::Min(4, $scale))
 }
 
+function Test-RtxVfxRuntime {
+    # 【为什么需要这个函数】
+    # 判断 RTXVideoSuperResolution「节点是否存在」远远不够。这个节点只是 Python 外壳，
+    # 真正的超分能力来自 NVIDIA NGX / MAXINE VFX 运行时。当 nvidia-vfx 包自带的
+    # nvngx_vsr.dll 与当前显卡驱动不匹配、或模型/feature 文件缺失时，
+    # 节点依然会出现在 /object_info 里（所以存在性探测会误判为「可用」），
+    # 但一旦真正创建效果实例就抛：
+    #   nvvfx.NvVFXError: NvVFX_CreateEffect failed:
+    #   The requested feature is not yet implemented (code -2)
+    # 结果是整个任务在采样完成后、后处理阶段崩掉 —— 用户白白等了几分钟。
+    #
+    # 【做法】提交一个极小的一次性探测工作流（64x64 纯色图 -> RTX超分 -> 预览），
+    # 用 ComfyUI 自己的 /history 读取执行结果。这比猜 nvidia-vfx 版本号可靠得多：
+    # 它直接回答「这台机器上、这个 ComfyUI 进程里，VSR 到底能不能跑」。
+    # 探测工作流与用户任务共用同一个 ComfyUI 进程，结论完全等价。
+    #
+    # 【开销】图极小，实测 1-3 秒；结果按 ComfyUI 地址缓存（见 $script:RtxVfxCache），
+    # 用户点「测试连接」时用 -Force 立即重测。
+    param([string]$ComfyUrl, [switch]$Force)
+    $now = Get-Date
+    $cached = $script:RtxVfxCache[$ComfyUrl]
+    if (-not $Force -and $cached -and ($now - $cached.At).TotalMinutes -lt 10) { return $cached }
+
+    $verdict = [pscustomobject]@{
+        At      = $now
+        Ok      = $false
+        Reason  = ''
+        Detail  = ''
+    }
+    try {
+        $clientId = [guid]::NewGuid().ToString('N')
+        # 探测工作流：颜色节点用 EmptyImage 生成纯色图，避免依赖任何外部素材文件。
+        $probe = [ordered]@{
+            '1' = [ordered]@{ class_type = 'EmptyImage'; inputs = [ordered]@{ width = 64; height = 64; batch_size = 1; color = 0 } }
+            '2' = [ordered]@{
+                class_type = 'RTXVideoSuperResolution'
+                inputs = [ordered]@{
+                    images = @('1', 0)
+                    resize_type = 'scale by multiplier'
+                    'resize_type.scale' = 2.0
+                    quality = 'ULTRA'
+                }
+            }
+            '3' = [ordered]@{ class_type = 'PreviewImage'; inputs = [ordered]@{ images = @('2', 0) } }
+        }
+        $payload = @{ prompt = $probe; client_id = $clientId } | ConvertTo-Json -Depth 100 -Compress
+        $submit = Invoke-Comfy 'POST' "$ComfyUrl/prompt" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
+        if (-not $submit.Success) {
+            $verdict.Reason = 'ProbeRejected'
+            $verdict.Detail = "探测工作流被拒绝（HTTP $($submit.StatusCode)）"
+            $script:RtxVfxCache[$ComfyUrl] = $verdict
+            return $verdict
+        }
+        $submitObj = [Text.Encoding]::UTF8.GetString($submit.Bytes) | ConvertFrom-Json
+        $promptId = [string]$submitObj.prompt_id
+        if ([string]::IsNullOrWhiteSpace($promptId)) {
+            $verdict.Reason = 'ProbeRejected'
+            $verdict.Detail = '探测工作流未返回 prompt_id'
+            $script:RtxVfxCache[$ComfyUrl] = $verdict
+            return $verdict
+        }
+
+        # 轮询执行结果，最多等 30 秒。VSR 初始化失败通常几秒内就返回。
+        for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Milliseconds 500
+            $hist = Invoke-Comfy 'GET' "$ComfyUrl/history/$promptId"
+            if (-not $hist.Success) { continue }
+            $histText = [Text.Encoding]::UTF8.GetString($hist.Bytes)
+            if ([string]::IsNullOrWhiteSpace($histText) -or $histText -eq '{}') { continue }
+            # 记录已出现：检查是否报错
+            if ($histText -match '"status_str"\s*:\s*"error"') {
+                $verdict.Ok = $false
+                $verdict.Reason = 'VsrUnavailable'
+                # 从异常信息里提取原始报错，便于网页展示真实原因
+                $m = [regex]::Match($histText, '"exception_message"\s*:\s*"((?:[^"\\]|\\.)*)"')
+                if ($m.Success) { $verdict.Detail = $m.Groups[1].Value -replace '\\n', ' ' -replace '\\"', '"' }
+                $script:RtxVfxCache[$ComfyUrl] = $verdict
+                return $verdict
+            }
+            if ($histText -match '"completed"\s*:\s*true' -or $histText -match '"status_str"\s*:\s*"success"') {
+                $verdict.Ok = $true
+                $verdict.Reason = 'Ok'
+                $verdict.Detail = 'RTX 视频超分运行正常'
+                $script:RtxVfxCache[$ComfyUrl] = $verdict
+                return $verdict
+            }
+        }
+        # 超时：不下"不可用"的结论（可能只是队列忙），标记为未知，调用方按可用处理但给出提示。
+        $verdict.Ok = $true
+        $verdict.Reason = 'ProbeTimeout'
+        $verdict.Detail = '探测超时（ComfyUI 队列可能繁忙），未确认 RTX 超分是否可用'
+        $script:RtxVfxCache[$ComfyUrl] = $verdict
+        return $verdict
+    } catch {
+        # 探测本身失败（网络等）不应阻断生成：按"未知"处理，留给实际执行去暴露问题。
+        $verdict.Ok = $true
+        $verdict.Reason = 'ProbeError'
+        $verdict.Detail = "探测异常：$($_.Exception.Message)"
+        return $verdict
+    }
+}
+
 function Add-RtxUpscaleChain {
     # 在输出端接入 RTX 放大链（只做后处理，不碰采样链）：
     # 源视频 -> GetVideoComponents（拆出图像帧/音频/fps/位深/色彩空间）
@@ -1019,7 +1125,9 @@ function Build-ReferenceWorkflow {
         } else {
             Remove-InputValue $Workflow $referenceNode $inputName
             # 预置但未使用的图片节点（169 等）：摘掉端口后若已无人引用，一并移除以避免空负载。
-            if ($i -eq 1) { Remove-OrphanLoader $Workflow @('169') }
+            # Remove-OrphanLoader 返回删除计数，必须丢弃：裸调用会把计数泄漏进本函数的输出流，
+            # 导致 Build-Workflow 收到「计数+工作流」数组、prompt 字段序列化成 JSON 数组（ComfyUI 500）。
+            if ($i -eq 1) { Remove-OrphanLoader $Workflow @('169') | Out-Null }
         }
     }
 
@@ -1049,7 +1157,7 @@ function Build-ReferenceWorkflow {
             # 再由 154(取尺寸) 供 136 使用。无视频时这条链整条都失去意义，一起清掉可避免把
             # 本地视频文件名带进请求体（旧版工作流里 141.video 曾直接存着用户素材名）。
             # 白名单刻意不含 171(ResolutionSelector)：它是 136 的 width/height 来源，必须保留。
-            if ($i -eq 0) { Remove-OrphanLoader $Workflow @('141', '156', '154') }
+            if ($i -eq 0) { Remove-OrphanLoader $Workflow @('141', '156', '154') | Out-Null }
         }
     }
 
@@ -1063,7 +1171,7 @@ function Build-ReferenceWorkflow {
         } else {
             Remove-InputValue $Workflow $referenceNode "ref_audios.ref_audio_$i"
             # 未使用的音频加载节点（170）：同样按需移除。
-            if ($i -eq 0) { Remove-OrphanLoader $Workflow @('170') }
+            if ($i -eq 0) { Remove-OrphanLoader $Workflow @('170') | Out-Null }
         }
     }
 
@@ -1795,6 +1903,10 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
                 }
             }
             $workflow = Build-Workflow $bodyObject.config $comfy
+            # 防御：PowerShell 函数会把管道输出全部收进返回值，任何一处裸调用有返回值的辅助函数
+            # 都会把 $workflow 从单个对象污染成数组（v20260912 的全能参考 500 就是这么来的）。
+            # 在这里拦下并给出明确原因，而不是把坏 payload 发给 ComfyUI 换回一句难懂的 500。
+            if ($workflow -is [System.Array]) { throw '内部错误：工作流构建结果是数组而非对象（函数输出泄漏），已阻止提交，请反馈给作者。' }
             $payload = @{ prompt = $workflow; client_id = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Depth 100 -Compress
             $remote = Invoke-Comfy 'POST' "$comfy/prompt" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
             if (-not $remote.Success) {
