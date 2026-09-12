@@ -1,9 +1,37 @@
 ﻿$ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
-$port = if ($env:WORKSTATION_PORT) { [int]$env:WORKSTATION_PORT } else { 8000 }
+$port = 8000
+if ($env:WORKSTATION_PORT) {
+    # 非法端口直接 [int] 转换会在脚本最外层抛错退出，这里改为提示后回退默认值。
+    $parsedPort = 0
+    if ([int]::TryParse($env:WORKSTATION_PORT, [ref]$parsedPort) -and $parsedPort -ge 1 -and $parsedPort -le 65535) {
+        $port = $parsedPort
+    } else {
+        Write-Host "  [提示] 环境变量 WORKSTATION_PORT=$($env:WORKSTATION_PORT) 不是合法端口，已回退到 8000。" -ForegroundColor DarkYellow
+    }
+}
 Add-Type -AssemblyName System.Net.Http
 Add-Type -AssemblyName System.Drawing
+
+# MiniMax H3 的 length 必须落在 5 + 17n 上（节点 length 的 min=5、step=17）。
+# 这是"秒数 -> 帧数"的唯一换算公式，基础三模式（节点 105:107）与全能参考（节点 131/141）
+# 共用它，避免同一个秒数在两种模式下算出不同的时长（此前两条链路各用一套公式，实测最多差 17 帧）。
+$script:FrameExpression = 'max(5, 5 + round((a * 24 - 5) / 17) * 17)'
+
+# ComfyUI 地址白名单（防 SSRF）：默认只允许本机与私有网段，需要连接其它主机时显式放开，例如
+#   set WORKSTATION_ALLOW_COMFY_HOSTS=comfy.example.com,10.0.0.9
+$script:AllowedComfyHosts = @()
+if ($env:WORKSTATION_ALLOW_COMFY_HOSTS) {
+    $script:AllowedComfyHosts = @($env:WORKSTATION_ALLOW_COMFY_HOSTS.Split(',') |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+}
+
+# ComfyUI 节点能力缓存（键为 ComfyUI 地址），避免每次生成都重新拉一遍 /object_info。
+$script:CapabilityCache = @{}
+
+# 本次构建产生的降级提示（例如缺少 RTX 节点而跳过放大）。每次构建前清空，构建后随响应回给网页。
+$script:BuildWarnings = @()
 
 # 复用同一个 HTTP 客户端，避免每次轮询都创建新连接。
 $handler = New-Object System.Net.Http.HttpClientHandler
@@ -96,6 +124,49 @@ function Repair-AiImageDataUrl {
     }
 }
 
+function Test-ComfyHostAllowed {
+    # 防 SSRF：服务端会带着用户传入的 comfy 地址去发请求，若不限制就等于一台内网请求跳板。
+    # 默认只放行本机 / 私有网段 / 单标签局域网主机名；其它地址必须由
+    # WORKSTATION_ALLOW_COMFY_HOSTS 显式放开。
+    param([string]$HostName)
+    $hostName = ([string]$HostName).ToLowerInvariant()
+    if (-not $hostName) { return $false }
+    if ($script:AllowedComfyHosts -contains $hostName) { return $true }
+    if ($hostName -eq 'localhost' -or $hostName -eq '::1' -or $hostName -eq '0.0.0.0') { return $true }
+    if ($hostName.EndsWith('.localhost') -or $hostName.EndsWith('.local')) { return $true }
+    # 单标签主机名（如 comfy-box）视为局域网名称
+    if ($hostName -notmatch '[.:]' -and $hostName -notmatch '^\d+$') { return $true }
+    # IPv6：ULA(fc00::/7) 与链路本地(fe80::/10)
+    if ($hostName -match '^(fc|fd)[0-9a-f]{2}:') { return $true }
+    if ($hostName -match '^fe[89ab][0-9a-f]:') { return $true }
+    $category = Get-IpCategory $hostName
+    return @('loopback', 'lan', 'linklocal', 'virtual') -contains $category
+}
+
+function Assert-SameOrigin {
+    # 防御跨站写请求：浏览器发起的跨站请求一定会带 Origin，且与服务自身地址不一致。
+    # 只在"带了 Origin 且主机名不匹配"时拒绝，因此 curl / 脚本（不带 Origin）不受影响，
+    # 与 ComfyUI 自身的 origin_only_middleware 策略保持一致。
+    param($Request)
+    $origin = [string]$Request.Headers['Origin']
+    if ([string]::IsNullOrWhiteSpace($origin)) { return }
+    $hostHeader = [string]$Request.Headers['Host']
+    if ([string]::IsNullOrWhiteSpace($hostHeader)) { return }
+    $originUri = $null
+    if (-not [Uri]::TryCreate($origin, [UriKind]::Absolute, [ref]$originUri)) { throw '请求来源无法解析，已拒绝。' }
+    $originHost = $originUri.Host.ToLowerInvariant()
+    $requestHost = ($hostHeader -split ':')[0].Trim('[', ']').ToLowerInvariant()
+    if ($originHost -ine $requestHost) { throw '拒绝来自其它站点的请求。' }
+}
+
+function Assert-RequestSize {
+    # 请求体上限必须在"读取之前"判断：Read-RequestBytes 会把整个 body 读进内存，
+    # 读完再检查等于没防住（内存已经被吃掉了）。分块传输时 ContentLength64 为 -1，
+    # 此时退回读取后的长度检查。
+    param($Request, [long]$MaxBytes, [string]$Message)
+    if ($Request.ContentLength64 -gt $MaxBytes) { throw $Message }
+}
+
 function Get-ComfyUrl {
     param($Request, $BodyObject = $null)
     $value = $Request.QueryString['comfy']
@@ -103,6 +174,11 @@ function Get-ComfyUrl {
     if (-not $value) { $value = 'http://127.0.0.1:8188' }
     $value = $value.Trim().TrimEnd('/')
     if ($value -notmatch '^https?://') { throw 'ComfyUI 地址必须以 http:// 或 https:// 开头。' }
+    $comfyUri = $null
+    if (-not [Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$comfyUri)) { throw 'ComfyUI 地址无法解析。' }
+    if (-not (Test-ComfyHostAllowed $comfyUri.DnsSafeHost)) {
+        throw "出于安全考虑，工作站只允许连接本机与局域网内的 ComfyUI（当前为 $($comfyUri.DnsSafeHost)）。如需连接其它主机，请设置环境变量 WORKSTATION_ALLOW_COMFY_HOSTS 显式放开。"
+    }
     return $value
 }
 
@@ -225,9 +301,14 @@ function Invoke-Comfy {
         [string]$Method,
         [string]$Url,
         [byte[]]$Body = $null,
-        [string]$ContentType = $null
+        [string]$ContentType = $null,
+        [hashtable]$Headers = $null
     )
     $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::new($Method), $Url)
+    # 允许调用方追加请求头；目前只有 /api/view 需要把浏览器的 Range 头透传给 ComfyUI。
+    if ($Headers) {
+        foreach ($name in $Headers.Keys) { $request.Headers.TryAddWithoutValidation($name, [string]$Headers[$name]) | Out-Null }
+    }
     if ($null -ne $Body) {
         $content = New-Object System.Net.Http.ByteArrayContent(,$Body)
         if ($ContentType) { $content.Headers.TryAddWithoutValidation('Content-Type', $ContentType) | Out-Null }
@@ -236,7 +317,17 @@ function Invoke-Comfy {
     $response = $http.SendAsync($request).GetAwaiter().GetResult()
     $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
     $responseType = if ($response.Content.Headers.ContentType) { $response.Content.Headers.ContentType.ToString() } else { 'application/octet-stream' }
-    return @{ StatusCode = [int]$response.StatusCode; Bytes = $bytes; ContentType = $responseType; Success = $response.IsSuccessStatusCode }
+    # 收集上游响应头，供 /api/view 透传分段下载所需的 Content-Range / Accept-Ranges。
+    $responseHeaders = @{}
+    foreach ($header in $response.Headers) { $responseHeaders[$header.Key] = ($header.Value -join ', ') }
+    foreach ($header in $response.Content.Headers) { $responseHeaders[$header.Key] = ($header.Value -join ', ') }
+    return @{
+        StatusCode = [int]$response.StatusCode
+        Bytes = $bytes
+        ContentType = $responseType
+        Success = $response.IsSuccessStatusCode
+        Headers = $responseHeaders
+    }
 }
 
 function Get-Node {
@@ -297,6 +388,52 @@ function Remove-WorkflowNode {
     }
 }
 
+# 移除「没有任何其他节点连线引用它」的孤立节点（含按指定方向级联）。
+# 背景：全能参考工作流 JSON 里预置了 137/169(图片)、141(视频)、170(音频) 等加载节点，
+# 用户没上传对应素材时，服务端只把聚合节点 136 上的 ref_* 端口摘掉，预置节点本身仍留在
+# 提交内容里（值是空字符串）。ComfyUI 的可达性校验只从 output_node 反向递归，这些孤立节点
+# 既不参与校验也不执行，功能上无害；但它们会白白占用请求体积，且在旧版工作流里曾把
+# 用户本地的素材文件名原样带到请求体中。这里在摘掉端口后顺带清理掉，避免无用负载与信息暴露。
+#
+# 【安全约束】只允许在 $Allowed 白名单内删除，白名单之外的节点一律保留。
+# 这是硬性护栏：视频链里 156(ImageResizeKJv2) 同时引用 171(ResolutionSelector)，
+# 而 171 是聚合节点 136 的 width/height 来源；一旦越界删除 171，整个工作流会构建失败。
+# 因此这里不做「智能推断」，只删除调用方显式点名的那几个节点。
+function Remove-OrphanLoader {
+    param($Workflow, [string[]]$Allowed = @())
+    $removed = 0
+    # 多轮扫描：删掉一个节点后，原本只被它引用的节点会变成新的孤立节点，需要再来一轮。
+    # 最多循环 10 轮，避免异常数据导致死循环。
+    for ($round = 0; $round -lt 10; $round++) {
+        $changed = $false
+        foreach ($nodeId in $Allowed) {
+            if (-not $Workflow.PSObject.Properties[$nodeId]) { continue }
+            # 仍被别的节点引用则保留（例如同一张参考图被多处复用）。
+            $referenced = $false
+            foreach ($property in $Workflow.PSObject.Properties) {
+                if ($property.Name -eq $nodeId) { continue }
+                $inputs = $property.Value.inputs
+                if (-not $inputs) { continue }
+                foreach ($input in $inputs.PSObject.Properties) {
+                    $value = $input.Value
+                    # 连线形如 @('137', 0)：第一个元素是上游节点 ID。
+                    if ($value -is [System.Array] -and $value.Count -ge 1 -and [string]$value[0] -eq $nodeId) {
+                        $referenced = $true
+                        break
+                    }
+                }
+                if ($referenced) { break }
+            }
+            if ($referenced) { continue }
+            Remove-WorkflowNode $Workflow $nodeId
+            $removed++
+            $changed = $true
+        }
+        if (-not $changed) { break }
+    }
+    return $removed
+}
+
 function Normalize-AspectRatio {
     param([string]$Value)
     $aliases = @{
@@ -327,6 +464,28 @@ function Normalize-AspectRatio {
         throw "不支持的画面比例：$normalizedInput"
     }
     return $aliases[$normalizedInput]
+}
+
+function Get-SafeMegapixels {
+    param($Value)
+    # ResolutionSelector 的 megapixels 有取值下界，且它是一条「数值输入」而不是连线，
+    # ComfyUI 在提交时会直接校验。网页输入框留空 / 非数字时前端会回退默认值，
+    # 但直连 API 的请求不受前端约束，因此服务端再做一次夹紧。
+    #
+    # 【踩坑记录】不要写成 [Math]::Max(0.1, [Math]::Min(4, $number))：
+    # PowerShell 5.1 在函数作用域内解析 [Math]::Min(4, <double变量>) 时会选中 Int32 重载，
+    # 把 double 直接截断成整数 —— 0.4 变 0、0.7 变 1（顶层作用域反而正常，所以极易漏测）。
+    # 两个参数都显式转 [double] 才会走 Double 重载。详见开发文档「踩坑记录」。
+    $fallback = 0.4
+    try {
+        if ($null -eq $Value) { return $fallback }
+        $number = [double]$Value
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return $fallback }
+        if ($number -le 0) { return $fallback }
+        return [Math]::Max([double]0.1, [Math]::Min([double]4, $number))
+    } catch {
+        return $fallback
+    }
 }
 
 function Get-SafeSeed {
@@ -393,32 +552,6 @@ function Remove-InputValue {
     if ($node.inputs.PSObject.Properties[$InputName]) { $node.inputs.PSObject.Properties.Remove($InputName) }
 }
 
-function Get-ReferenceFrameLength {
-    param([double]$Duration)
-    $seconds = [Math]::Max(1, [Math]::Min(15, $Duration))
-    $frames = 5 + [Math]::Round(($seconds * 24 - 5) / 17) * 17
-    return [int][Math]::Max(5, $frames)
-}
-
-function Get-ReferenceResolution {
-    param([string]$AspectRatio, [double]$Megapixels)
-    $ratioMap = @{
-        '1:1 (Square)' = 1.0
-        '2:3 (Portrait Photo)' = (2.0 / 3.0)
-        '3:2 (Photo)' = (3.0 / 2.0)
-        '3:4 (Portrait Standard)' = (3.0 / 4.0)
-        '4:3 (Standard)' = (4.0 / 3.0)
-        '9:16 (Portrait Widescreen)' = (9.0 / 16.0)
-        '16:9 (Widescreen)' = (16.0 / 9.0)
-        '21:9 (Ultrawide)' = (21.0 / 9.0)
-    }
-    $ratio = if ($ratioMap.ContainsKey($AspectRatio)) { [double]$ratioMap[$AspectRatio] } else { 1.0 }
-    $area = [Math]::Max(0.1, [Math]::Min(2.0, $Megapixels)) * 1000000
-    $height = [Math]::Max(32, [int]([Math]::Sqrt($area / $ratio) / 32) * 32)
-    $width = [Math]::Max(32, [int]([Math]::Sqrt($area * $ratio) / 32) * 32)
-    return [pscustomobject]@{ width = $width; height = $height }
-}
-
 function Resolve-ComfyModelType {
     param([string]$ModelType)
     switch ($ModelType) {
@@ -437,6 +570,242 @@ function Get-ComfyModelNames {
     if ($data -is [System.Array]) { return @($data | ForEach-Object { [string]$_ }) }
     if ($data.files -is [System.Array]) { return @($data.files | ForEach-Object { [string]$_ }) }
     return @()
+}
+
+function ConvertFrom-JsonStringLiteral {
+    # 把 JSON 字符串字面量（已去掉两端引号）里的转义序列还原成真实字符。
+    # 只处理常见的几类，避免引入完整 JSON 解析器的复杂度：
+    #   \" \\ \/ \b \f \n \r \t 以及 \uXXXX（含 UTF-16 代理对）
+    # 目的：让文本扫描回退路径与 JavaScriptSerializer 路径返回**完全一致**的节点名集合。
+    # 例：ComfyUI 返回 "LoRA Syntax \u2192 Path (LoraManager)"，
+    #     解码后应为 "LoRA Syntax → Path (LoraManager)"。
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text) -or $Text.IndexOf('\') -lt 0) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $i = 0
+    $len = $Text.Length
+    while ($i -lt $len) {
+        $ch = $Text[$i]
+        if ($ch -ne '\' -or $i -eq ($len - 1)) {
+            [void]$sb.Append($ch)
+            $i++
+            continue
+        }
+        $next = $Text[$i + 1]
+        switch ($next) {
+            '"'  { [void]$sb.Append('"');  $i += 2; continue }
+            '\'  { [void]$sb.Append('\');  $i += 2; continue }
+            '/'  { [void]$sb.Append('/');  $i += 2; continue }
+            'b'  { [void]$sb.Append([char]8);  $i += 2; continue }
+            'f'  { [void]$sb.Append([char]12); $i += 2; continue }
+            'n'  { [void]$sb.Append([char]10); $i += 2; continue }
+            'r'  { [void]$sb.Append([char]13); $i += 2; continue }
+            't'  { [void]$sb.Append([char]9);  $i += 2; continue }
+            'u'  {
+                if ($i + 6 -le $len) {
+                    $hex = $Text.Substring($i + 2, 4)
+                    $code = 0
+                    if ([int]::TryParse($hex, [System.Globalization.NumberStyles]::HexNumber,
+                            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$code)) {
+                        [void]$sb.Append([char]$code)
+                        $i += 6
+                        continue
+                    }
+                }
+                # 不是合法 \uXXXX，原样保留
+                [void]$sb.Append($next)
+                $i += 2
+                continue
+            }
+            default {
+                [void]$sb.Append($next)
+                $i += 2
+                continue
+            }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-ObjectInfoNodeNamesFromText {
+    # 【回退实现】逐字符扫描 JSON 文本，收集「顶层节点类名」。
+    # 只在 Get-ObjectInfoNodeNames 的首选方案（JavaScriptSerializer）不可用或抛异常时才走到这里，
+    # 属于最后一道保险，保证再极端的环境下能力探测也不会因为解析问题而整体失败。
+    #
+    # 只需要「顶层键」，也就是紧跟在 { 或 , 之后、深度为 1 的键名。
+    # 用逐字符扫描统计深度（跳过字符串内部），比正则更准确：正则会把嵌套层里
+    # 形如 "output":{ 的键也当成节点名（实测多出 27 个 → 16319 个误匹配）。
+    # 5.6MB / 3027 节点实测约 0.8 秒，只在缓存过期时执行一次，可接受。
+    param([string]$JsonText)
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $depth = 0
+    $i = 0
+    $length = $JsonText.Length
+    while ($i -lt $length) {
+        $ch = $JsonText[$i]
+        if ($ch -eq '"') {
+            # 读一个完整字符串（处理 \" 转义），并记录它在扫描结束时的下标
+            $i++
+            $start = $i
+            while ($i -lt $length) {
+                if ($JsonText[$i] -eq '\') { $i += 2; continue }
+                if ($JsonText[$i] -eq '"') { break }
+                $i++
+            }
+            $text = $JsonText.Substring($start, [Math]::Max(0, $i - $start))
+            # 字符串结束后紧跟 ':' 说明它是键；再看它前面第一个非空白字符是不是 '{' 或 ','
+            $after = $i + 1
+            while ($after -lt $length -and [char]::IsWhiteSpace($JsonText[$after])) { $after++ }
+            if ($after -lt $length -and $JsonText[$after] -eq ':') {
+                $before = $start - 2
+                while ($before -ge 0 -and [char]::IsWhiteSpace($JsonText[$before])) { $before-- }
+                if ($before -ge 0 -and ($JsonText[$before] -eq '{' -or $JsonText[$before] -eq ',')) {
+                    # 深度 1 = 顶层
+                    if ($depth -eq 1) {
+                        # 【必须做转义解码，否则与 JavaScriptSerializer 路径结果不一致】
+                        # ComfyUI 会把节点名里的非 ASCII 字符写成 \uXXXX 转义，
+                        # 例如 "LoRA Syntax \u2192 Path (LoraManager)"（→ 被转义）。
+                        # JS 路径会自动解码成 "LoRA Syntax → Path (LoraManager)"，
+                        # 这里若不解码，两条路径返回的节点名集合就会有差异（实测差 1 项）。
+                        $names.Add((ConvertFrom-JsonStringLiteral $text)) | Out-Null
+                    }
+                }
+            }
+            $i++
+            continue
+        }
+        if ($ch -eq '{' -or $ch -eq '[') { $depth++ }
+        elseif ($ch -eq '}' -or $ch -eq ']') { $depth-- }
+        $i++
+    }
+    # 【踩坑记录】必须写 return ,$names（逗号前缀）：
+    # 直接 return $names 会让 PowerShell 把 HashSet 展开成 Object[]，
+    # 调用方的 .Contains() 就退化成大小写敏感的线性查找。详见 Get-ObjectInfoNodeNames 的说明。
+    return ,$names
+}
+
+function Get-ObjectInfoNodeNames {
+    # 从 /object_info 的原始 JSON 文本中取出「顶层节点类名」集合。
+    #
+    # 【为什么不用 ConvertFrom-Json】
+    # Windows PowerShell 5.1 的 ConvertFrom-Json 会把对象解析成「大小写不敏感」的
+    # PSCustomObject/字典，一旦 ComfyUI 里存在仅大小写不同的两个节点名，就直接抛
+    # 「转换的字典包含重复的键」并让整个探测失败。本机实测就有一例：
+    #   dynamicThresholdingFull 与 DynamicThresholdingFull（3027 个节点、5.6MB 响应）
+    # 这类重复只影响解析，不影响节点本身是否可用。
+    #
+    # 【实现策略：双保险】
+    # 首选 JavaScriptSerializer（.NET Framework 内置 System.Web.Extensions，无需装包）：
+    #   它的反序列化结果是 Dictionary[string,object]，**【大小写敏感】**，
+    #   两个仅大小写不同的键可以共存，因此天然绕开了 ConvertFrom-Json 的坑；
+    #   实测 5.6MB / 3027 节点约 190 毫秒，比逐字符扫描快约 4 倍。
+    # 回退 逐字符扫描（Get-ObjectInfoNodeNamesFromText）：
+    #   万一 JavaScriptSerializer 不可用（被裁剪的 .NET 运行时、极简 Nano Server 等）
+    #   或抛异常，自动降级到纯文本扫描，保证功能不中断。
+    #
+    # 【关键陷阱：MaxJsonLength 默认只有 2MB】
+    # JavaScriptSerializer 默认 MaxJsonLength = 2097152（2MB），
+    # ComfyUI 装了较多自定义节点后 object_info 很容易超过 2MB（本机 5.6MB），
+    # 不改这个值会直接抛「已超出 maxJsonLength」。
+    # 必须显式把 MaxJsonLength 设成 [int]::MaxValue。
+    param([string]$JsonText)
+    if ([string]::IsNullOrWhiteSpace($JsonText)) {
+        # 同样用逗号前缀，保证返回的是 HashSet 而不是被展开的数组
+        return ,(New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase))
+    }
+
+    # —— 首选：JavaScriptSerializer ——
+    try {
+        # 【踩坑记录】判断类型是否可用不能用 [System.Type]::GetType('System.Web.Script.Serialization.JavaScriptSerializer')：
+        # Type.GetType 只在「已加载的程序集」和 mscorlib 里找，System.Web.Extensions 默认没加载，
+        # 于是会静默返回 $null，导致首选路径被无声跳过（实测就是这样退化成文本扫描的）。
+        # 正确做法是先显式 Add-Type 加载程序集，再创建实例。
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        # 见上方【关键陷阱】：不设这一行，>2MB 的 object_info 会直接失败
+        $serializer.MaxJsonLength = [int]::MaxValue
+        $dict = $serializer.DeserializeObject($JsonText)
+        if ($dict -is [System.Collections.IDictionary]) {
+            # JavaScriptSerializer 返回的是 Dictionary[string,object]，键是**【大小写敏感】**的，
+            # 所以 dynamicThresholdingFull 与 DynamicThresholdingFull 能同时存在、互不覆盖。
+            $names = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($key in $dict.Keys) { $names.Add([string]$key) | Out-Null }
+            # 【踩坑记录】必须写 return ,$names（逗号前缀），不能写 return $names！
+            # PowerShell 的 return 会把「可枚举对象」自动展开并重新打包：
+            #   return $names        → 调用方拿到的是 System.Object[]（数组），
+            #                          它的 .Contains() 是大小写敏感的线性查找，
+            #                          会漏判 DynamicThresholdingFull 这类仅大小写不同的节点名。
+            #   return ,$names       → 原样返回 HashSet，.Contains() 走 OrdinalIgnoreCase 比较器。
+            # 实测：不加逗号时 $classes.GetType() 是 System.Object[]，行为与预期不符。
+            if ($names.Count -gt 0) { return ,$names }
+        }
+    } catch {
+        # 静默降级：把失败原因记到构建警告里，方便排查，但不阻断能力探测
+        Add-BuildWarning "节点列表解析已降级为文本扫描模式（原因：$($_.Exception.Message)）。功能正常，仅首次探测略慢。"
+    }
+
+    # —— 回退：纯文本扫描 ——
+    # 同样必须用逗号前缀，避免 HashSet 被 PowerShell 展开成 Object[]。
+    return ,(Get-ObjectInfoNodeNamesFromText $JsonText)
+}
+
+function Add-BuildWarning {
+    # 记录本次构建的降级提示，最终由 /api/generate 放进响应里，网页会弹出提示。
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    if ($script:BuildWarnings -notcontains $Message) { $script:BuildWarnings += $Message }
+}
+
+function Set-CapabilityCache {
+    # 把"刚刚实际用过的能力表"写回缓存。
+    # 场景：网页提交时 Get-ComfyCapabilities 的 60 秒缓存刚好过期，于是重新探测了一次；
+    # 构建结束后若不在 60 秒内补写缓存，下一次提交又会再探测一次（object_info 是大响应）。
+    param([string]$ComfyUrl, $Data)
+    if (-not $ComfyUrl -or -not $Data) { return }
+    $script:CapabilityCache[$ComfyUrl] = [pscustomobject]@{ At = (Get-Date); Data = $Data }
+}
+
+function Get-ComfyCapabilities {
+    # 读取 ComfyUI 的 /object_info，判断哪些「可选节点」存在。
+    # 目的是兼容性：用户没装 RTX / TE-Speed / LoraManager 这类非关键节点时，
+    # 工作站应自动降级继续出片，而不是直接报错阻断整个生成。
+    # 结果按 ComfyUI 地址缓存 60 秒；用户手动点「测试连接」时用 -Force 立即重新探测
+    # （例如刚装完节点包，不想等缓存过期）。
+    param([string]$ComfyUrl, [switch]$Force)
+    $now = Get-Date
+    $cached = $script:CapabilityCache[$ComfyUrl]
+    if (-not $Force -and $cached -and ($now - $cached.At).TotalSeconds -lt 60) { return $cached.Data }
+
+    $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
+    if (-not $remote.Success) { throw "无法读取 ComfyUI 节点列表（HTTP $($remote.StatusCode)），请确认 ComfyUI 已启动。" }
+    $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
+    # 双保险解析（优先 JavaScriptSerializer，失败回退文本扫描）：
+    # 见 Get-ObjectInfoNodeNames 的完整说明。绝不要改回 ConvertFrom-Json——
+    # 节点名存在仅大小写不同的重复时它会直接抛异常。
+    $classes = Get-ObjectInfoNodeNames $jsonText
+    # 【防御性收口】显式包成 HashSet[string] 并用 OrdinalIgnoreCase 比较器。
+    # 原因：PowerShell 的 return 可能把集合展开成 Object[]，而数组的 .Contains()
+    # 是大小写敏感的线性查找，会漏判仅大小写不同的节点名。
+    # 这里统一收口，保证后续所有 .Contains() 都是正确的大小写不敏感语义。
+    $nodeSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in @($classes)) { [void]$nodeSet.Add([string]$n) }
+
+    $data = [pscustomobject]@{
+        # 可选节点：缺失时按降级继续
+        RtxUpscale   = $nodeSet.Contains('RTXVideoSuperResolution')
+        LoraManager  = $nodeSet.Contains('Lora Loader (LoraManager)')
+        TEspeed      = $nodeSet.Contains('TESpeedMiniMaxH3')
+        VhsLoadVideo = $nodeSet.Contains('VHS_LoadVideo')
+        # 关键节点：缺失时对应模式直接不可用，需要给出明确提示
+        SaveVideo                 = $nodeSet.Contains('SaveVideo')
+        MiniMaxH3ImageToVideo     = $nodeSet.Contains('MiniMaxH3ImageToVideo')
+        MiniMaxH3ReferenceToVideo = $nodeSet.Contains('MiniMaxH3ReferenceToVideo')
+        ResolutionSelector        = $nodeSet.Contains('ResolutionSelector')
+        ComfyMathExpression       = $nodeSet.Contains('ComfyMathExpression')
+        CreateVideo               = $nodeSet.Contains('CreateVideo')
+    }
+    $script:CapabilityCache[$ComfyUrl] = [pscustomobject]@{ At = $now; Data = $data }
+    return $data
 }
 
 function Assert-SelectedModelsExist {
@@ -474,45 +843,44 @@ function Get-ReferenceVideoLoader {
     try {
         $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
         if ($remote.Success) {
-            # 不只依赖 ConvertFrom-Json 后的 PSObject 属性索引：部分 PowerShell/ComfyUI
-            # 组合在超大 object_info 响应下会出现属性索引误判，但原始 JSON 中节点确实存在。
+            # 全部走原始 JSON 文本判断，不再 ConvertFrom-Json：
+            # 1) 超大 object_info（本机 5.4MB / 3027 节点）下 PSObject 属性索引会误判；
+            # 2) 节点名存在仅大小写不同的重复时 ConvertFrom-Json 会直接抛异常
+            #    （见 Get-ObjectInfoNodeNames 说明）。
             $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
             if ($jsonText -match '"VHS_LoadVideo"\s*:') { return 'VHS_LoadVideo' }
-            $info = $jsonText | ConvertFrom-Json
-            $loadVideo = $info.PSObject.Properties['LoadVideo']
-            if ($loadVideo -and @($loadVideo.Value.output) -contains 'IMAGE') { return 'LoadVideo' }
+            # ComfyUI 内置的 LoadVideo 节点：确认它确实声明了 IMAGE 输出，
+            # 避免只是名字里含 LoadVideo 却拿不到帧序列。
+            if ($jsonText -match '"LoadVideo"\s*:\s*\{[^}]*"output"\s*:\s*\[[^\]]*"IMAGE"') { return 'LoadVideo' }
         }
     } catch {}
     throw '当前 ComfyUI 未提供可将视频转换为 IMAGE 帧序列的 VHS_LoadVideo 节点，暂时不能提交视频参考。请安装 VideoHelperSuite 后重试。'
 }
 
-function Test-CleanVramNodeAvailable {
-    # 「生成后自动清理显存」依赖 ComfyUI-Easy-Use 的 easy cleanGpuUsed 节点；
-    # 普通三模式工作流 JSON 内置了该节点，只有全能参考需要动态注入，注入前先探测。
-    # 沿用 Get-ReferenceVideoLoader 的做法：直接匹配原始 JSON 文本，规避超大 object_info 的解析问题。
+function Get-ComfyQueueState {
+    # 读取 ComfyUI 队列状态，用于判断现在是否"完全空闲"。
+    # 只有「正在执行」和「排队等待」的任务都为 0 时才算空闲，显存清理只在这个时机执行，
+    # 保证清理落在"上一个任务已结束、下一个任务还没开始"的安全间隙里，不会打断排队生成。
     param([string]$ComfyUrl)
-    try {
-        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
-        if ($remote.Success) {
-            $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
-            if ($jsonText -match '"easy cleanGpuUsed"\s*:') { return $true }
-        }
-    } catch {}
-    return $false
+    $remote = Invoke-Comfy 'GET' "$ComfyUrl/queue"
+    if (-not $remote.Success) { throw "无法读取 ComfyUI 队列状态（HTTP $($remote.StatusCode)）" }
+    $queue = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
+    $running = @($queue.queue_running).Count
+    $pending = @($queue.queue_pending).Count
+    return [pscustomobject]@{
+        Running = $running
+        Pending = $pending
+        Idle    = (($running -eq 0) -and ($pending -eq 0))
+    }
 }
 
-function Test-RtxUpscaleNodeAvailable {
-    # 「RTX 视频放大」依赖 NVIDIA RTX Video 官方节点包的 RTXVideoSuperResolution 节点。
-    # 沿用 Test-CleanVramNodeAvailable 的做法：匹配 object_info 原始文本，规避超大响应的解析成本。
+function Clear-ComfyVram {
+    # 调用 ComfyUI 官方 /free 接口卸载模型并释放显存，效果等同在 ComfyUI 界面点「清理显存」。
+    # 注意：这是"任务边界"清理，调用方必须先确认队列空闲。
     param([string]$ComfyUrl)
-    try {
-        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info"
-        if ($remote.Success) {
-            $jsonText = [Text.Encoding]::UTF8.GetString($remote.Bytes)
-            if ($jsonText -match '"RTXVideoSuperResolution"\s*:') { return $true }
-        }
-    } catch {}
-    return $false
+    $body = [Text.Encoding]::UTF8.GetBytes('{"unload_models":true,"free_memory":true}')
+    $remote = Invoke-Comfy 'POST' "$ComfyUrl/free" $body 'application/json'
+    if (-not $remote.Success) { throw "ComfyUI 清理显存失败（HTTP $($remote.StatusCode)）" }
 }
 
 function Get-RtxScaleValue {
@@ -573,7 +941,16 @@ function Build-ReferenceWorkflow {
     Set-InputValue $Workflow $clipNode 'clip_name' ([string]$Config.clip)
     Set-InputValue $Workflow $videoVaeNode 'vae_name' ([string]$Config.videoVae)
     Set-InputValue $Workflow $audioVaeNode 'vae_name' ([string]$Config.audioVae)
-    Set-InputValue $Workflow $durationNode 'value' ([double]$Config.duration)
+    # 时长夹紧到 1-15 秒（与基础三模式的处理一致），否则直连 API 可以传任意值：
+    # 因为 length 是一条连线，ComfyUI 的校验期看不到它的数值，超大时长会直接入队。
+    # 帧数换算也必须与基础三模式共用同一个公式：此前这里沿用了工作流 JSON 里烘焙的旧公式
+    # （向上取整到下一个 5+17n），而基础模式用的是"四舍五入到最近的 5+17n"，
+    # 结果同一个秒数在两种模式下最多差 17 帧（0.71 秒），例如 6 秒分别是 158 帧与 141 帧。
+    $duration = [Math]::Max(1, [Math]::Min(15, [int]$Config.duration))
+    Set-InputValue $Workflow $durationNode 'value' ([double]$duration)
+    Set-InputValue $Workflow '131' 'expression' $script:FrameExpression
+    # 节点 144 用同一公式算出参考视频要截取多少帧（frame_load_cap），保持两者一致。
+    Set-InputValue $Workflow '144' 'value' $script:FrameExpression
     Set-InputValue $Workflow $noiseNode 'noise_seed' (Get-SafeSeed $Config.seed)
 
     # Ref2VA 使用独立的 BasicScheduler / KSamplerSelect 节点，不能复用普通模式的 105:* 节点。
@@ -587,20 +964,37 @@ function Build-ReferenceWorkflow {
 
     $aspectRatio = Normalize-AspectRatio ([string]$Config.aspectRatio)
     Set-InputValue $Workflow $resolutionNode 'aspect_ratio' $aspectRatio
-    Set-InputValue $Workflow $resolutionNode 'megapixels' ([double]$Config.megapixels)
+    Set-InputValue $Workflow $resolutionNode 'megapixels' (Get-SafeMegapixels $Config.megapixels)
 
     Set-InputValue $Workflow $referenceNode 'prompt' ([string]$Config.prompt)
     Set-InputValue $Workflow $referenceNode 'length' @('131', 1)
     Set-InputValue $Workflow $referenceNode 'width' @($resolutionNode, 0)
     Set-InputValue $Workflow $referenceNode 'height' @($resolutionNode, 1)
 
-    $loraText = Set-LoraManagerInputs $Workflow $loraNodeId $Config.loras
-    $modelLink = if ($loraText.Count -gt 0) { @($loraNodeId, 0) } else { @($unetNode, 0) }
-    Set-InputValue $Workflow $speedNode 'model' $modelLink
-    if ($loraText.Count -eq 0) {
+    # LoRA / TE-Speed 都是可选自定义节点：缺失时旁路继续生成，不让整单失败。
+    $capabilities = Get-ComfyCapabilities $ComfyUrl
+    Set-CapabilityCache $ComfyUrl $capabilities
+    $loraCount = 0
+    if ($capabilities.LoraManager) {
+        $loraText = Set-LoraManagerInputs $Workflow $loraNodeId $Config.loras
+        $loraCount = $loraText.Count
+    } else {
+        Add-BuildWarning '未检测到 ComfyUI-Lora-Manager 节点，本次已跳过 LoRA（仍会正常生成，只是少了 LoRA 效果）。安装该节点包并重启 ComfyUI 后会自动恢复。'
+    }
+
+    $modelLink = if ($loraCount -gt 0) { @($loraNodeId, 0) } else { @($unetNode, 0) }
+    if ($loraCount -eq 0) {
         # 未启用 LoRA 时模型链已绕过该节点，但 ComfyUI 仍会校验节点里烘焙的默认 LoRA 名，
         # 文件被移入子文件夹/重命名后会直接 400，这里整个移除。
         Remove-WorkflowNode $Workflow $loraNodeId
+    }
+    if ($capabilities.TEspeed) {
+        Set-InputValue $Workflow $speedNode 'model' $modelLink
+    } else {
+        # 没有 TE-Speed 时把模型直接接到采样器的 guider（节点 126），跳过加速而不是报错。
+        Add-BuildWarning '未检测到 TE-SpeedMiniMaxH3 加速节点，本次已跳过加速（生成会变慢，结果正常）。安装该节点包并重启 ComfyUI 后会自动恢复。'
+        Remove-WorkflowNode $Workflow $speedNode
+        Set-InputValue $Workflow '126' 'model' $modelLink
     }
 
     $imageNames = @($Config.referenceImages)
@@ -622,7 +1016,11 @@ function Build-ReferenceWorkflow {
             if (-not $Workflow.PSObject.Properties[$nodeId]) { Add-WorkflowNode $Workflow $nodeId 'LoadImage' ([ordered]@{ image = [string]$imageNames[$i] }) | Out-Null }
             else { Set-InputValue $Workflow $nodeId 'image' ([string]$imageNames[$i]) }
             Set-InputValue $Workflow $referenceNode $inputName @($nodeId, 0)
-        } else { Remove-InputValue $Workflow $referenceNode $inputName }
+        } else {
+            Remove-InputValue $Workflow $referenceNode $inputName
+            # 预置但未使用的图片节点（169 等）：摘掉端口后若已无人引用，一并移除以避免空负载。
+            if ($i -eq 1) { Remove-OrphanLoader $Workflow @('169') }
+        }
     }
 
     $videoLoader = $null
@@ -647,6 +1045,11 @@ function Build-ReferenceWorkflow {
         } else {
             Remove-InputValue $Workflow $referenceNode $videoInputName
             Remove-InputValue $Workflow $referenceNode $videoAudioInputName
+            # 未使用的视频加载节点（141）及其专属尺寸链：141 载入视频后经 156(缩放) 算尺寸，
+            # 再由 154(取尺寸) 供 136 使用。无视频时这条链整条都失去意义，一起清掉可避免把
+            # 本地视频文件名带进请求体（旧版工作流里 141.video 曾直接存着用户素材名）。
+            # 白名单刻意不含 171(ResolutionSelector)：它是 136 的 width/height 来源，必须保留。
+            if ($i -eq 0) { Remove-OrphanLoader $Workflow @('141', '156', '154') }
         }
     }
 
@@ -659,6 +1062,8 @@ function Build-ReferenceWorkflow {
             Set-InputValue $Workflow $referenceNode "ref_audios.ref_audio_$i" @($audioNodeId, 0)
         } else {
             Remove-InputValue $Workflow $referenceNode "ref_audios.ref_audio_$i"
+            # 未使用的音频加载节点（170）：同样按需移除。
+            if ($i -eq 0) { Remove-OrphanLoader $Workflow @('170') }
         }
     }
 
@@ -669,34 +1074,53 @@ function Build-ReferenceWorkflow {
     Remove-WorkflowNode $Workflow '165'
     Remove-WorkflowNode $Workflow '166'
 
-    # 全能参考工作流没有内置清理节点：开关开启时动态注入 easy cleanGpuUsed，
-    # 接在 CreateVideo(130) 之后，与普通三模式的内置接线一致；关闭则保持原状。
-    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
-    # 保存节点(172)固定接在 CreateVideo(130) 上；显存清理与 RTX 放大依次插在两者之间。
+    # 显存清理不再放进工作流：工作流末尾的清理节点会在推理刚结束时立刻清显存，而 ComfyUI 会
+    # 马上接着执行队列里的下一个任务，导致下一个任务加载模型时读取失败
+    # （comfy-aimdo 动态显存加载的页缓存被清掉）。现统一改为"提交任务前、且队列空闲时"
+    # 调用 ComfyUI 官方 /free 接口，让清理时机与排队执行彻底解耦。
+    # 保存节点(172)固定接在 CreateVideo(130) 上；RTX 放大插在两者之间。
     $saveSource = '130'
-    if ($cleanVram) {
-        if (-not (Test-CleanVramNodeAvailable $ComfyUrl)) {
-            throw '「生成后自动清理显存」需要 ComfyUI-Easy-Use 插件的 easy cleanGpuUsed 节点，当前未检测到。请确认 ComfyUI 正在运行且已安装该插件，或在高级参数里关闭这个开关。'
-        }
-        Remove-WorkflowNode $Workflow '105:130'
-        Add-WorkflowNode $Workflow ([string]$nextId) 'easy cleanGpuUsed' ([ordered]@{ anything = @('130', 0) }) | Out-Null
-        $saveSource = [string]$nextId
-        $nextId++
-    }
+    $finalVideoLink = @('130', 0)
     $rtxScale = Get-RtxScaleValue $Config.rtxUpscaleScale
     if ($Config.rtxUpscale) {
-        if (-not (Test-RtxUpscaleNodeAvailable $ComfyUrl)) {
-            throw '「RTX 视频放大」需要 NVIDIA RTX Video 官方节点包的 RTXVideoSuperResolution 节点，当前未检测到。请安装该节点包后重启 ComfyUI，或关闭放大开关。'
+        # RTX 放大是可选的画质增强：没装节点包时跳过放大继续出片。
+        if (-not $capabilities.RtxUpscale) {
+            Add-BuildWarning '未检测到 RTXVideoSuperResolution 节点（NVIDIA RTX Video 节点包），本次已跳过 RTX 放大，视频按原分辨率输出。安装节点包并重启 ComfyUI 后会自动恢复。'
+        } else {
+            $videoOut = Add-RtxUpscaleChain $Workflow $saveSource $rtxScale $nextId
+            $finalVideoLink = @($videoOut, 0)
         }
-        $videoOut = Add-RtxUpscaleChain $Workflow $saveSource $rtxScale $nextId
-        Set-InputValue $Workflow '172' 'video' @($videoOut, 0)
     }
+
+    # 输出节点统一用 ComfyUI 官方内置的 SaveVideo（工作流 JSON 里节点 172 已经是 SaveVideo），
+    # 全能参考因此不再依赖第三方的 ComfyUI-MetadataCleaner。
+    Set-InputValue $Workflow '172' 'video' $finalVideoLink
 
     return $Workflow
 }
 
 function Build-Workflow {
     param($Config, [string]$ComfyUrl)
+    # 每次构建都重置降级提示；能力探测结果按地址缓存 60 秒。
+    $script:BuildWarnings = @()
+    $capabilities = Get-ComfyCapabilities $ComfyUrl
+    # 探测结果用回写刷新一次时间戳：避免用户连续提交时每 60 秒就重新拉一遍 /object_info。
+    Set-CapabilityCache $ComfyUrl $capabilities
+    # 关键节点缺失时给出明确原因（这些由较新版本 ComfyUI 内置，无法自动降级）。
+    $missingCore = @()
+    if ([string]$Config.mode -eq 'ref2va') {
+        if (-not $capabilities.MiniMaxH3ReferenceToVideo) { $missingCore += 'MiniMaxH3ReferenceToVideo' }
+    } elseif (-not $capabilities.MiniMaxH3ImageToVideo) {
+        $missingCore += 'MiniMaxH3ImageToVideo'
+    }
+    if (-not $capabilities.ResolutionSelector) { $missingCore += 'ResolutionSelector' }
+    if (-not $capabilities.ComfyMathExpression) { $missingCore += 'ComfyMathExpression' }
+    if (-not $capabilities.CreateVideo) { $missingCore += 'CreateVideo' }
+    # 四个工作流的输出节点都是官方内置的 SaveVideo，它是必需节点。
+    if (-not $capabilities.SaveVideo) { $missingCore += 'SaveVideo' }
+    if ($missingCore.Count -gt 0) {
+        throw "当前 ComfyUI 缺少必需节点：$($missingCore -join '、')。这些节点由较新版本 ComfyUI 内置（comfy_extras），请更新 ComfyUI 后重试（本项目在 0.34.5 上验证）。"
+    }
     $allowedFiles = @(
         'minimaxH3文生视频基础加速流.json',
         'minimaxH3图生视频基础加速流.json',
@@ -717,12 +1141,13 @@ function Build-Workflow {
 
     $duration = [Math]::Max(1, [Math]::Min(15, [int]$Config.duration))
     Set-InputValue $workflow '105:111' 'value' $duration
-    # MiniMax H3 接受 5 + 17n 帧。按 24fps 将秒数映射到最接近的合法帧数，而不是旧版一律向上取整。
-    Set-InputValue $workflow '105:107' 'expression' 'max(5, 5 + round((a * 24 - 5) / 17) * 17)'
+    # MiniMax H3 接受 5 + 17n 帧。按 24fps 将秒数映射到最接近的合法帧数（公式见 $script:FrameExpression，
+    # 全能参考模式共用同一份，避免同一个秒数在两种模式下算出不同时长）。
+    Set-InputValue $workflow '105:107' 'expression' $script:FrameExpression
     # ResolutionSelector 的 COMBO 值必须逐字匹配。这里同时兼容旧版网页保存在 localStorage 中的名称。
     $aspectRatio = Normalize-AspectRatio ([string]$Config.aspectRatio)
     Set-InputValue $workflow '115' 'aspect_ratio' $aspectRatio
-    Set-InputValue $workflow '115' 'megapixels' ([double]$Config.megapixels)
+    Set-InputValue $workflow '115' 'megapixels' (Get-SafeMegapixels $Config.megapixels)
     Set-InputValue $workflow '105:6' 'unet_name' ([string]$Config.unet)
     Set-InputValue $workflow '105:13' 'clip_name' ([string]$Config.clip)
     Set-InputValue $workflow '105:11' 'vae_name' ([string]$Config.videoVae)
@@ -749,38 +1174,52 @@ function Build-Workflow {
     Remove-WorkflowNode $workflow '105:124'
     Remove-WorkflowNode $workflow '105:132'
 
-    $loraText = Set-LoraManagerInputs $workflow '105:129' $Config.loras
-    $loraCount = $loraText.Count
+    # LoRA 与 TE-Speed 都是「可选」自定义节点：用户没装时不能让整单失败，改为旁路后继续生成。
+    $loraCount = 0
+    if ($capabilities.LoraManager) {
+        $loraText = Set-LoraManagerInputs $workflow '105:129' $Config.loras
+        $loraCount = $loraText.Count
+    } else {
+        Add-BuildWarning '未检测到 ComfyUI-Lora-Manager 节点，本次已跳过 LoRA（仍会正常生成，只是少了 LoRA 效果）。安装该节点包并重启 ComfyUI 后会自动恢复。'
+    }
 
-    # 无 LoRA 时绕过 LoraManager；有 LoRA 时保留本地 JSON 的 UNET -> LoRA -> TE-Speed 加速链。
+    # 无 LoRA（或没有 LoraManager）时绕过该节点，模型从 UNET 直接往下走。
     $speedModel = if ($loraCount -gt 0) { @('105:129', 0) } else { @('105:6', 0) }
-    Set-InputValue $workflow '105:122' 'model' $speedModel
     if ($loraCount -eq 0) {
         # 未启用 LoRA 时移除节点，避免其烘焙的默认 LoRA 名失效导致 ComfyUI 校验 400。
         Remove-WorkflowNode $workflow '105:129'
     }
 
-    # 「生成后自动清理显存」：普通三模式的工作流内置了 easy cleanGpuUsed（105:130，
-    # 接在 CreateVideo 之后）。开关关闭时移除该节点，并把保存节点直接接回 CreateVideo，
-    # 避免 92 悬空指向已删除的节点。
-    $cleanVram = if ($null -eq $Config.cleanVram) { $true } else { [bool]$Config.cleanVram }
-    # RTX 放大链从保存节点的当前源头接入：开启清理时源为清理节点，关闭时为 CreateVideo。
-    $saveSource = if ($cleanVram) { '105:130' } else { '105:91' }
-    if (-not $cleanVram) {
-        Remove-WorkflowNode $workflow '105:130'
-        Set-InputValue $workflow '92' 'video' @('105:91', 0)
+    if ($capabilities.TEspeed) {
+        Set-InputValue $workflow '105:122' 'model' $speedModel
+    } else {
+        # 没有 TE-Speed 节点时把模型链直接接到采样器的 guider，跳过加速而不是报错。
+        Add-BuildWarning '未检测到 TE-SpeedMiniMaxH3 加速节点，本次已跳过加速（生成会变慢，结果正常）。安装该节点包并重启 ComfyUI 后会自动恢复。'
+        Remove-WorkflowNode $workflow '105:122'
+        Set-InputValue $workflow '105:16' 'model' $speedModel
     }
+
+    # 普通三模式的工作流 JSON 内置了 easy cleanGpuUsed（105:130，接在 CreateVideo 之后），
+    # 这里始终移除它并把保存节点接回 CreateVideo：工作流末尾清显存会在推理刚结束时执行，
+    # 与紧接着从队列启动的下一个任务抢时序，导致下一个任务加载模型失败。显存清理统一改由
+    # /api/generate 在"提交前且队列空闲"时调用 ComfyUI 官方 /free 接口完成。
+    Remove-WorkflowNode $workflow '105:130'
+    Set-InputValue $workflow '92' 'video' @('105:91', 0)
+    # RTX 放大链从 CreateVideo 接入。
+    $saveSource = '105:91'
     $rtxScale = Get-RtxScaleValue $Config.rtxUpscaleScale
     if ($Config.rtxUpscale) {
-        if (-not (Test-RtxUpscaleNodeAvailable $ComfyUrl)) {
-            throw '「RTX 视频放大」需要 NVIDIA RTX Video 官方节点包的 RTXVideoSuperResolution 节点，当前未检测到。请安装该节点包后重启 ComfyUI，或关闭放大开关。'
+        # RTX 放大是可选的画质增强：没装节点包时跳过放大继续出片，而不是阻断整个生成。
+        if (-not $capabilities.RtxUpscale) {
+            Add-BuildWarning '未检测到 RTXVideoSuperResolution 节点（NVIDIA RTX Video 节点包），本次已跳过 RTX 放大，视频按原分辨率输出。安装节点包并重启 ComfyUI 后会自动恢复。'
+        } else {
+            $nextId = 1000
+            foreach ($property in $workflow.PSObject.Properties) {
+                try { $nextId = [Math]::Max($nextId, [int]$property.Name + 1) } catch {}
+            }
+            $videoOut = Add-RtxUpscaleChain $workflow $saveSource $rtxScale $nextId
+            Set-InputValue $workflow '92' 'video' @($videoOut, 0)
         }
-        $nextId = 1000
-        foreach ($property in $workflow.PSObject.Properties) {
-            try { $nextId = [Math]::Max($nextId, [int]$property.Name + 1) } catch {}
-        }
-        $videoOut = Add-RtxUpscaleChain $workflow $saveSource $rtxScale $nextId
-        Set-InputValue $workflow '92' 'video' @($videoOut, 0)
     }
     return $workflow
 }
@@ -1226,6 +1665,12 @@ $mime = @{
     '.txt'='text/plain; charset=utf-8'; '.map'='application/json; charset=utf-8'
 }
 
+# 静态托管的扩展名白名单。项目目录里同时放着 AI提示词配置.json（含真实 API Key）、
+# server.ps1（服务端源码）、工作流 JSON、启动脚本等，若不限制类型，同网段任何设备只要
+# 直接 GET 文件名就能把它们下载走（实测 /server.ps1 与 /AI提示词配置.json 均返回 200）。
+# 前端用到的静态资源只有 index.html、favicon.svg 与 assets/ 下的 css/js，所以这里只放开这些类型。
+$script:StaticExtensions = @('.html', '.js', '.css', '.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.ico', '.woff', '.woff2')
+
 # 让控制台窗口始终有固定标题，更新助手重启服务后标题保持一致，方便用户按说明关闭服务。
 try { $Host.UI.RawUI.WindowTitle = 'MiniMax H3 工作站服务' } catch {}
 
@@ -1245,6 +1690,10 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             Send-Json $ctx @{ models = $models; templates = $templates; defaultModel = [string]$config.'默认模型'; defaultTemplate = [string]$config.'默认模板' }
         }
         elseif ($path -eq '/api/ai-prompt' -and $method -eq 'POST') {
+            Assert-SameOrigin $ctx.Request
+            # 上限必须在读取之前判断，否则超大 body 先吃掉内存了（分块传输时 ContentLength64 为 -1，
+            # 由读取后的长度检查兜底）。
+            Assert-RequestSize $ctx.Request 50000000 'AI 提示词请求过大，请减少或压缩图片。'
             $bodyBytes = Read-RequestBytes $ctx.Request
             if ($bodyBytes.Length -gt 50000000) { throw 'AI 提示词请求过大，请减少或压缩图片。' }
             $bodyObject = [Text.Encoding]::UTF8.GetString($bodyBytes) | ConvertFrom-Json
@@ -1259,6 +1708,29 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             $deviceName = $stats.devices[0].name
             Send-Json $ctx @{ ok = $true; device = if ($deviceName) { $deviceName } else { 'ComfyUI 已连接' } }
         }
+        elseif ($path -eq '/api/free' -and $method -eq 'POST') {
+            # 只允许 POST：清理显存是状态变更操作。若同时允许 GET，任何网页只要放一个
+            # <img src="http://127.0.0.1:8000/api/free"> 就能跨站把 ComfyUI 的模型卸载掉。
+            Assert-SameOrigin $ctx.Request
+            # soft=1：「自动清理显存」在任务结束后由网页调用。队列非空（还有任务在跑或排队）时
+            # 静默跳过，等最后一个任务结束再清；不会打断任何生成。
+            # 不带 soft：用户手动点「立即清理显存」。队列非空时直接拒绝并提示原因，避免手滑打断生成。
+            $comfy = Get-ComfyUrl $ctx.Request
+            $soft = ([string]$ctx.Request.QueryString['soft'] -eq '1')
+            $queueState = Get-ComfyQueueState $comfy
+            if (-not $queueState.Idle) {
+                $busy = "执行中 $($queueState.Running) 个 / 排队中 $($queueState.Pending) 个"
+                if ($soft) {
+                    Send-Json $ctx @{ ok = $true; skipped = $true; message = "队列仍有任务（$busy），本次跳过清理。" }
+                } else {
+                    throw "ComfyUI 队列尚未空闲（$busy），此时清理会中断生成，请等任务完成后再试。"
+                }
+            } else {
+                Clear-ComfyVram $comfy
+                Write-Host "  [显存] ComfyUI 队列空闲，已卸载模型并释放显存。" -ForegroundColor DarkCyan
+                Send-Json $ctx @{ ok = $true; message = '显存已清理：模型已从显存卸载。' }
+            }
+        }
         elseif ($path -eq '/api/check-update' -and $method -eq 'GET') {
             $fresh = ([string]$ctx.Request.QueryString['fresh'] -eq '1')
             $info = Get-UpdateInfo -Fresh $fresh
@@ -1267,6 +1739,7 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
         elseif ($path -eq '/api/apply-update' -and $method -eq 'POST') {
             # 仅接受 application/json 请求：跨站表单无法携带该 Content-Type，阻止其它网站诱导本机执行更新。
             if ($ctx.Request.ContentType -notmatch 'application/json') { throw '请通过页面内的一键更新按钮执行更新。' }
+            Assert-SameOrigin $ctx.Request
             Invoke-ApplyUpdate
         }
         elseif ($path -eq '/api/object-info' -and $method -eq 'GET') {
@@ -1287,17 +1760,40 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             Send-Bytes $ctx $remote.Bytes $remote.ContentType $remote.StatusCode
         }
         elseif ($path -eq '/api/upload' -and $method -eq 'POST') {
+            Assert-SameOrigin $ctx.Request
+            # 单次上传上限 200MB（网页侧的限制是图片 30MB / 视频 50MB / 音频 15MB，
+            # 这里只是防止无鉴权的局域网请求用超大 body 把服务内存打满）。
+            Assert-RequestSize $ctx.Request 209715200 '上传文件过大（单次不超过 200MB）。'
             $comfy = Get-ComfyUrl $ctx.Request
             $body = Read-RequestBytes $ctx.Request
+            if ($body.Length -gt 209715200) { throw '上传文件过大（单次不超过 200MB）。' }
             $remote = Invoke-Comfy 'POST' "$comfy/upload/image" $body $ctx.Request.ContentType
             Send-Bytes $ctx $remote.Bytes $remote.ContentType $remote.StatusCode
         }
         elseif ($path -eq '/api/generate' -and $method -eq 'POST') {
+            Assert-SameOrigin $ctx.Request
+            # 生成请求只是提示词 + 参数，2MB 足够；上限放在读取之前。
+            Assert-RequestSize $ctx.Request 2097152 '生成请求过大。'
             $bodyBytes = Read-RequestBytes $ctx.Request
+            if ($bodyBytes.Length -gt 2097152) { throw '生成请求过大。' }
             $bodyText = [Text.Encoding]::UTF8.GetString($bodyBytes)
             $bodyObject = $bodyText | ConvertFrom-Json
             $comfy = Get-ComfyUrl $ctx.Request $bodyObject
             Assert-SelectedModelsExist $bodyObject.config $comfy
+            # 「自动清理显存」在任务边界执行：仅当 ComfyUI 队列完全空闲（没有正在执行、也没有
+            # 排队等待的任务）时，才先卸载模型释放显存，再提交本次任务。此时清理永远落在
+            # "上一个任务已结束、下一个任务还没开始"的安全间隙；队列里还有任务就自动跳过，
+            # 避免像工作流内清理节点那样清掉排队中下一个任务刚加载的模型。
+            # 清理属于优化动作，失败只提示、不阻断生成。
+            $cleanVram = if ($null -eq $bodyObject.config.cleanVram) { $true } else { [bool]$bodyObject.config.cleanVram }
+            if ($cleanVram) {
+                try {
+                    $queueState = Get-ComfyQueueState $comfy
+                    if ($queueState.Idle) { Clear-ComfyVram $comfy }
+                } catch {
+                    Write-Host "  [提示] 提交前清理显存已跳过：$($_.Exception.Message)" -ForegroundColor DarkYellow
+                }
+            }
             $workflow = Build-Workflow $bodyObject.config $comfy
             $payload = @{ prompt = $workflow; client_id = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Depth 100 -Compress
             $remote = Invoke-Comfy 'POST' "$comfy/prompt" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
@@ -1305,7 +1801,21 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
                 $detail = [Text.Encoding]::UTF8.GetString($remote.Bytes)
                 throw "ComfyUI 拒绝工作流（HTTP $($remote.StatusCode)）：$detail"
             }
-            Send-Bytes $ctx $remote.Bytes $remote.ContentType $remote.StatusCode
+            if ($script:BuildWarnings.Count -gt 0) {
+                # 把降级提示附在响应里，网页会逐条弹出，让用户清楚本次跳过了哪些可选节点。
+                $result = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
+                $result | Add-Member -NotePropertyName warnings -NotePropertyValue @($script:BuildWarnings) -Force
+                Send-Json $ctx $result $remote.StatusCode
+            } else {
+                Send-Bytes $ctx $remote.Bytes $remote.ContentType $remote.StatusCode
+            }
+        }
+        elseif ($path -eq '/api/capabilities' -and $method -eq 'GET') {
+            # 供网页判断哪些可选节点存在，从而禁用/提示不可用的开关（如 RTX 放大）。
+            # fresh=1 强制重新探测（用户刚装完节点包时用）。
+            $comfy = Get-ComfyUrl $ctx.Request
+            $force = -not [string]::IsNullOrWhiteSpace([string]$ctx.Request.QueryString['fresh'])
+            Send-Json $ctx (Get-ComfyCapabilities $comfy -Force:$force)
         }
         elseif ($path -eq '/api/debug-workflow' -and $method -eq 'POST') {
             $bodyBytes = Read-RequestBytes $ctx.Request
@@ -1369,7 +1879,17 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             $filename = [Uri]::EscapeDataString([string]$ctx.Request.QueryString['filename'])
             $subfolder = [Uri]::EscapeDataString([string]$ctx.Request.QueryString['subfolder'])
             $fileType = [Uri]::EscapeDataString([string]$ctx.Request.QueryString['type'])
-            $remote = Invoke-Comfy 'GET' "$comfy/view?filename=$filename&subfolder=$subfolder&type=$fileType"
+            # 把浏览器的 Range 头透传给 ComfyUI，并回传 206 / Content-Range / Accept-Ranges：
+            # 网页里的 <video> 拖动进度条依赖分段下载，不透传会导致每次都要整段读取且无法 seek。
+            $forwardHeaders = @{}
+            $rangeHeader = [string]$ctx.Request.Headers['Range']
+            if (-not [string]::IsNullOrWhiteSpace($rangeHeader)) { $forwardHeaders['Range'] = $rangeHeader }
+            $remote = Invoke-Comfy 'GET' "$comfy/view?filename=$filename&subfolder=$subfolder&type=$fileType" $null $null $forwardHeaders
+            foreach ($headerName in @('Content-Range', 'Accept-Ranges', 'Content-Disposition')) {
+                if ($remote.Headers -and $remote.Headers.ContainsKey($headerName)) {
+                    try { $ctx.Response.Headers[$headerName] = $remote.Headers[$headerName] } catch {}
+                }
+            }
             Send-Bytes $ctx $remote.Bytes $remote.ContentType $remote.StatusCode
         }
         elseif ($path.StartsWith('/api/')) {
@@ -1379,11 +1899,21 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             $rel = $path.TrimStart('/')
             $file = if ($rel) { [System.IO.Path]::GetFullPath((Join-Path $root ($rel.Replace('/', '\')))) } else { Join-Path $root 'index.html' }
             $rootFull = [System.IO.Path]::GetFullPath($root)
-            if (-not $file.StartsWith($rootFull) -or -not (Test-Path $file -PathType Leaf)) {
-                $file = Join-Path $root 'index.html'
-            }
+            # 路径必须确实位于项目目录内。原实现用 $file.StartsWith($rootFull) 且区分大小写：
+            # 既会把同名前缀的兄弟目录（如「…包-X」）判为合法，也不符合 Windows 路径不区分大小写的语义。
+            $rootPrefix = $rootFull.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+            $insideRoot = $file.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+                          $file.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
             $ext = [System.IO.Path]::GetExtension($file).ToLower()
-            $type = if ($mime.ContainsKey($ext)) { $mime[$ext] } else { 'application/octet-stream' }
+            # 同时要求：位于项目目录内 + 扩展名在白名单内 + 文件存在。不满足一律回退到首页，
+            # 避免把 server.ps1、AI提示词配置.json、工作流 JSON 等当成静态资源直接发出去。
+            if (-not $insideRoot -or
+                -not $script:StaticExtensions.Contains($ext) -or
+                -not (Test-Path $file -PathType Leaf)) {
+                $file = Join-Path $root 'index.html'
+                $ext = '.html'
+            }
+            $type = if ($mime.ContainsKey($ext)) { $mime[$ext] } else { 'text/html; charset=utf-8' }
             # HTML 不缓存：更新替换文件后浏览器刷新必须拿到新页面（JS/CSS 由 ?v= 参数控制缓存）。
             if ($ext -eq '.html') { $ctx.Response.Headers['Cache-Control'] = 'no-store' }
             Send-Bytes $ctx ([System.IO.File]::ReadAllBytes($file)) $type 200

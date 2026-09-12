@@ -87,9 +87,21 @@ const state = {
   updateBusy: false,
 };
 
+// 任务列表内存上限：超出后从最旧的非活跃任务开始丢弃。
+// 与 persistTasks 的 slice(0, 30) 不同——那个只管写入 localStorage 的内容，
+// 内存里的 state.tasks 若不限制，长时间开着页面不断提交会一直增长（每个任务还带 outputs 数组）。
+const MAX_TASKS_IN_MEMORY = 60;
+
+// 单个任务的轮询时长上限：超过后停止轮询并提示用户手动刷新。
+// 场景：ComfyUI 重启导致 history 记录丢失，任务会永远停在「恢复中」；
+// 或用户在别处取消了任务，工作站这边拿不到终态。没有这个上限会无限轮询下去。
+const MAX_POLL_DURATION_MS = 6 * 60 * 60 * 1000; // 6 小时
+// 连续查询失败达到该次数时，停止轮询并明确告知用户（而不是无限重试）。
+const MAX_QUERY_FAILURES = 60;
+
 const $ = (id) => document.getElementById(id);
 const elements = {
-  connectionPill: $("connectionPill"), connectionText: $("connectionText"), comfyUrl: $("comfyUrl"),
+  connectionPill: $("connectionPill"), connectionText: $("connectionText"), comfyUrl: $("comfyUrl"), connectionHint: $("connectionHint"),
   testConnectionButton: $("testConnectionButton"), scanModelsButton: $("scanModelsButton"), modelScanStatus: $("modelScanStatus"),
   modeControl: $("modeControl"), imageUploadArea: $("imageUploadArea"), firstFrameCard: $("firstFrameCard"), lastFrameCard: $("lastFrameCard"),
   firstFrameInput: $("firstFrameInput"), lastFrameInput: $("lastFrameInput"), firstFramePreview: $("firstFramePreview"), lastFramePreview: $("lastFramePreview"),
@@ -100,12 +112,15 @@ const elements = {
   generateAiPromptButton: $("generateAiPromptButton"), aiModelSelect: $("aiModelSelect"), aiTemplateSelect: $("aiTemplateSelect"), aiReadImages: $("aiReadImages"),
   durationRange: $("durationRange"), durationNumber: $("durationNumber"), durationValue: $("durationValue"), aspectRatio: $("aspectRatio"), megapixels: $("megapixels"),
   unetModel: $("unetModel"), clipModel: $("clipModel"), videoVae: $("videoVae"), audioVae: $("audioVae"), loraList: $("loraList"), loraEmpty: $("loraEmpty"),
-  addLoraButton: $("addLoraButton"), steps: $("steps"), seed: $("seed"), samplerName: $("samplerName"), randomSeedButton: $("randomSeedButton"),
-  teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), cleanVram: $("cleanVram"),
-  rtxUpscale: $("rtxUpscale"), rtxUpscaleScale: $("rtxUpscaleScale"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
+  addLoraButton: $("addLoraButton"), steps: $("steps"), seed: $("seed"), samplerName: $("samplerName"),
+  samplerNameOptions: $("samplerNameOptions"), randomSeedButton: $("randomSeedButton"),
+  teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), cleanVram: $("cleanVram"), freeVramButton: $("freeVramButton"),
+  rtxUpscale: $("rtxUpscale"), rtxUpscaleScale: $("rtxUpscaleScale"), capabilityNote: $("capabilityNote"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
   taskList: $("taskList"), taskEmpty: $("taskEmpty"), refreshTasksButton: $("refreshTasksButton"), clearTasksButton: $("clearTasksButton"), toastRegion: $("toastRegion"),
   checkUpdateButton: $("checkUpdateButton"), updateBanner: $("updateBanner"), updateTitle: $("updateTitle"), updateDetail: $("updateDetail"),
   applyUpdateButton: $("applyUpdateButton"), updateCommitLink: $("updateCommitLink"), dismissUpdateButton: $("dismissUpdateButton"),
+  // 以下两项在 HTML 中缺少 id，这里登记后在启动时补齐，避免文案与样式悄悄失效。
+  freeVramHint: $("freeVramHint"), aiPromptHint: $("aiPromptHint"),
 };
 
 function normalizeComfyUrl(value = elements.comfyUrl.value) {
@@ -147,6 +162,16 @@ function setConnection(stateName, text) {
 
 function clampDuration(value) {
   return Math.max(1, Math.min(15, Number.parseInt(value, 10) || 1));
+}
+
+// 基础分辨率（百万像素）：允许留空或输入非法字符时回退默认值 0.4。
+// 之前这里直接 Number() 转换，空串会变成 0 —— 0 是合法数字但毫无意义，
+// 而 ResolutionSelector 的 megapixels 有取值下界，最终表现为提交后 ComfyUI 报参数错误。
+const DEFAULT_MEGAPIXELS = 0.4;
+function clampMegapixels(value) {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MEGAPIXELS;
+  return Math.max(0.1, Math.min(4, parsed));
 }
 
 function syncDuration(value) {
@@ -198,6 +223,8 @@ async function loadAiPromptConfig() {
     const preferredTemplate = stored.aiTemplate || config.defaultTemplate;
     if (config.models.some((item) => item.id === preferredModel)) elements.aiModelSelect.value = preferredModel;
     if (config.templates.some((item) => item.id === preferredTemplate)) elements.aiTemplateSelect.value = preferredTemplate;
+    // 选项已就绪，之后 saveSettings 直接读下拉即可，不再需要暂存值兜底。
+    pendingAiSelection = { model: "", template: "" };
     elements.generateAiPromptButton.disabled = !config.models.length || !config.templates.length;
   } catch (error) {
     elements.aiModelSelect.replaceChildren();
@@ -330,6 +357,30 @@ function fillSelect(select, items, preferred) {
   select.value = unique.includes(current) ? current : (findModelName(unique, preferred) || unique[0]);
 }
 
+function fillDatalist(datalist, items) {
+  // 把可选项填进 <datalist>，配合 <input list="..."> 使用。
+  // 与 fillSelect 的区别：不替换输入框的值、不禁用输入框——用户仍然可以手动输入
+  // 列表以外的值（例如自定义节点提供的采样器），只是会失去下拉提示。
+  if (!datalist) return 0;
+  const unique = [...new Set((items || []).filter((item) => typeof item === "string" && item.trim()))];
+  datalist.replaceChildren();
+  unique.forEach((item) => {
+    const option = document.createElement("option");
+    option.value = item;
+    datalist.appendChild(option);
+  });
+  return unique.length;
+}
+
+// 采样器候选：从 ComfyUI 的 /object_info 里读 KSampler 系节点的 sampler_name 选项。
+// 这些节点任取其一即可拿到完整列表（ComfyUI 全局只有一套采样器注册表）。
+// 拿不到时返回空数组，输入框保持可手动输入，不阻断使用。
+const SAMPLER_NODE_CLASSES = ["KSampler", "KSamplerAdvanced", "KSamplerSelect", "SamplerCustom"];
+function collectSamplerNames(objectInfo) {
+  if (!objectInfo || typeof objectInfo !== "object") return [];
+  return findNodeOptions(objectInfo, SAMPLER_NODE_CLASSES, ["sampler_name"]);
+}
+
 function getDefaultLora() {
   const preferred = state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaLora : DEFAULT_MODELS.lora;
   return findModelName(state.models.lora, preferred);
@@ -373,16 +424,104 @@ async function testConnection(showSuccess = true) {
   try {
     const data = await fetchJson(apiUrl("/api/health", comfyUrl), {}, 15000);
     setConnection("connected", data.device || "ComfyUI 已连接");
+    setConnectionHint("");
+    // 顺带探测可选节点是否存在：缺 RTX / LoRA 管理器之类的节点时提前禁用或提示，
+    // 而不是等用户提交后才从错误里知道（服务端同样会自动降级，双保险）。
+    // 手动点「测试连接」时强制重新探测，方便刚装完节点包后立刻生效。
+    await loadCapabilities(comfyUrl, showSuccess);
     if (showSuccess) toast("ComfyUI 连接成功。", "success");
     saveSettings();
     return true;
   } catch (error) {
     setConnection("error", "连接失败");
     if (showSuccess) toast(error.message, "error");
+    // 地址被安全白名单拦下时，在地址框下方常驻显示原因，避免用户只看到一条会消失的提示。
+    setConnectionHint(
+      String(error.message || "").includes("WORKSTATION_ALLOW_COMFY_HOSTS")
+        ? "该地址不在允许范围内。工作站默认只连接本机与局域网内的 ComfyUI；如需连接其它主机（如公网地址），请先设置环境变量 WORKSTATION_ALLOW_COMFY_HOSTS 并重启服务。"
+        : ""
+    );
     return false;
   } finally {
     elements.testConnectionButton.disabled = false;
   }
+}
+
+// 在 ComfyUI 地址下方常驻显示一行说明；传空串即隐藏。
+function setConnectionHint(message) {
+  const hint = elements.connectionHint;
+  if (!hint) return;
+  if (message) {
+    hint.textContent = message;
+    hint.classList.remove("hidden");
+  } else {
+    hint.textContent = "";
+    hint.classList.add("hidden");
+  }
+}
+
+// 缺少可选节点时要在提示里说的项目：
+// [服务端能力字段, 服务端降级提示里出现的节点名, 简短标签, 完整说明]
+const CAPABILITY_ITEMS = [
+  ["RtxUpscale", "RTXVideoSuperResolution", "RTX 放大", "RTX 视频放大（需 NVIDIA RTX Video 节点包）：不可用，开关已禁用，提交时会自动跳过"],
+  ["TEspeed", "TE-SpeedMiniMaxH3", "TE-Speed 加速", "TE-SpeedMiniMaxH3：未检测到，提交时会跳过加速（生成变慢，结果正常）"],
+  ["LoraManager", "Lora-Manager", "LoRA", "ComfyUI-Lora-Manager：未检测到，提交时会跳过 LoRA"],
+  ["VhsLoadVideo", "VideoHelperSuite", "视频参考素材", "VideoHelperSuite（VHS_LoadVideo）：未检测到，全能参考无法使用视频参考素材"],
+  ["SaveVideo", "内置 SaveVideo", "视频保存节点", "内置 SaveVideo：未检测到，所有模式都无法保存视频，请更新 ComfyUI"],
+  ["MiniMaxH3ImageToVideo", "MiniMaxH3ImageToVideo", "文生/图生/首尾帧", "MiniMaxH3ImageToVideo：未检测到，文生 / 图生 / 首尾帧模式不可用，请更新 ComfyUI"],
+  ["MiniMaxH3ReferenceToVideo", "MiniMaxH3ReferenceToVideo", "全能参考", "MiniMaxH3ReferenceToVideo：未检测到，全能参考模式不可用，请更新 ComfyUI"],
+  ["ResolutionSelector", "ResolutionSelector", "画面比例", "ResolutionSelector：未检测到，请更新 ComfyUI"],
+  ["ComfyMathExpression", "ComfyMathExpression", "帧数换算", "ComfyMathExpression：未检测到，请更新 ComfyUI"],
+  ["CreateVideo", "CreateVideo", "视频合成", "CreateVideo：未检测到，请更新 ComfyUI"],
+];
+
+// loadCapabilities 带并发去重的实现放在文件末尾（见「能力探测并发去重」注释）。
+
+function applyCapabilities(caps) {
+  if (!caps) return;
+  const missing = CAPABILITY_ITEMS.filter(([key]) => caps[key] === false).map(([, , , text]) => text);
+
+  // RTX 放大依赖节点包，缺节点时直接禁用并取消勾选：避免用户以为开了但实际被跳过。
+  const rtxAvailable = caps.RtxUpscale !== false;
+  elements.rtxUpscale.disabled = !rtxAvailable;
+  elements.rtxUpscaleScale.disabled = !rtxAvailable;
+  if (!rtxAvailable && elements.rtxUpscale.checked) {
+    elements.rtxUpscale.checked = false;
+    saveSettings();
+  }
+
+  const note = elements.capabilityNote;
+  if (!note) return;
+  if (!missing.length) {
+    note.replaceChildren();
+    note.classList.add("hidden");
+    return;
+  }
+  const title = document.createElement("strong");
+  title.textContent = "当前 ComfyUI 缺少以下节点，已自动降级（不影响出片）：";
+  const list = document.createElement("ul");
+  missing.forEach((text) => {
+    const item = document.createElement("li");
+    item.textContent = text;
+    list.appendChild(item);
+  });
+  note.replaceChildren(title, list);
+  note.classList.remove("hidden");
+}
+
+// 服务端在构建工作流时若跳过了可选节点，会在提交结果里带上 warnings。
+// 这里只弹一条简短汇总，逐条原因已经常驻显示在「高级参数」的兼容性提示里。
+function reportBuildWarnings(warnings) {
+  if (!Array.isArray(warnings) || !warnings.length) return;
+  const labels = [];
+  CAPABILITY_ITEMS.forEach(([, marker, label]) => {
+    if (warnings.some((text) => String(text).includes(marker)) && !labels.includes(label)) labels.push(label);
+  });
+  toast(
+    labels.length
+      ? `本次已自动跳过：${labels.join("、")}。原因见「高级参数」里的兼容性提示。`
+      : "本次生成已自动跳过部分可选功能，原因见「高级参数」里的兼容性提示。"
+  );
 }
 
 async function scanModels() {
@@ -409,6 +548,19 @@ async function scanModels() {
     fillSelect(elements.clipModel, state.models.clip, state.storedModels.clip || DEFAULT_MODELS.clip);
     fillSelect(elements.videoVae, state.models.vae, state.storedModels.videoVae || DEFAULT_MODELS.videoVae);
     fillSelect(elements.audioVae, state.models.vae, state.storedModels.audioVae || DEFAULT_MODELS.audioVae);
+    // 顺手把本机 ComfyUI 的真实采样器列表填进 datalist（复用同一次 object-info 响应，不额外发请求）。
+    // 这样用户从下拉里选就不会填出不存在的采样器名，从而避免提交后被 ComfyUI 校验拒绝。
+    // 注意：只是「候选项」，输入框仍允许手动输入其它值。
+    const samplerNames = collectSamplerNames(objectInfo);
+    if (fillDatalist(elements.samplerNameOptions, samplerNames) > 0) {
+      // 若当前保存的采样器在新列表里不存在，给出提示但不强改（用户可能有意使用自定义值）。
+      const current = elements.samplerName.value.trim();
+      if (current && !samplerNames.includes(current)) {
+        elements.samplerName.title = `当前填写的「${current}」不在本机采样器列表中，提交可能失败。可从下拉列表中选择。`;
+      } else {
+        elements.samplerName.removeAttribute("title");
+      }
+    }
     // 扫描后把旧保存的 LoRA 名归一化成当前库里的名字（文件可能被移入了子文件夹）。
     state.loras = state.loraModeDefaults
       ? []
@@ -676,7 +828,7 @@ function buildGenerationConfig() {
     prompt: elements.promptInput.value.trim(),
     duration,
     aspectRatio: normalizeAspectRatio(elements.aspectRatio.value),
-    megapixels: Number(elements.megapixels.value),
+    megapixels: clampMegapixels(elements.megapixels.value),
     unet: elements.unetModel.value,
     clip: elements.clipModel.value,
     videoVae: elements.videoVae.value,
@@ -742,6 +894,9 @@ async function generate() {
       body: JSON.stringify({ comfyUrl, config }),
     }, 120000);
 
+    // 服务端在缺少可选节点时会自动降级并附带 warnings，这里给用户一个简短提示（不影响本次出片）。
+    reportBuildWarnings(result.warnings);
+
     const createdAt = Date.now();
     const task = {
       id: result.prompt_id,
@@ -769,6 +924,43 @@ async function generate() {
   } finally {
     elements.generateButton.disabled = false;
     elements.generateButton.textContent = "开始生成视频";
+  }
+}
+
+let vramCleanInFlight = false;
+
+async function cleanVramAfterTask(comfyUrl) {
+  // 任务进入终态后自动清理显存（「自动清理显存」开关开启时）。
+  // 传 soft=1 给服务端：队列里还有任务在跑或排队时静默跳过，等最后一个任务结束再清——
+  // 这样既做到"生成完就释放显存"，又不会清掉排队中下一个任务刚加载的模型。
+  if (!elements.cleanVram.checked || vramCleanInFlight) return;
+  vramCleanInFlight = true;
+  try {
+    await fetchJson(apiUrl("/api/free?soft=1", comfyUrl || normalizeComfyUrl()), { method: "POST" }, 60000);
+  } catch {
+    // 清理属于优化动作，失败静默处理，不影响任务结果展示。
+  } finally {
+    vramCleanInFlight = false;
+  }
+}
+
+async function freeVram() {
+  // 手动清理显存：交给服务端调用 ComfyUI 官方 /free（unload_models + free_memory）。
+  // 服务端会先确认队列空闲，队列里还有任务时直接拒绝，避免打断正在执行或排队的生成。
+  const button = elements.freeVramButton;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "清理中…";
+  try {
+    const comfyUrl = normalizeComfyUrl();
+    if (!/^https?:\/\//i.test(comfyUrl)) throw new Error("ComfyUI 地址必须以 http:// 或 https:// 开头。");
+    const result = await fetchJson(apiUrl("/api/free", comfyUrl), { method: "POST" }, 60000);
+    toast(result.message || "显存已清理。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -855,6 +1047,8 @@ async function queryTask(taskId, manual = false) {
           task.elapsedMs = Math.max(0, task.finishedAt - Number(task.startedAt || task.createdAt || task.finishedAt));
         }
         stopPolling(task.id);
+        // 任务结束后清理显存：服务端会先确认 ComfyUI 队列空闲，队列里还有任务时静默跳过。
+        cleanVramAfterTask(task.comfyUrl);
       }
     }
   } catch (error) {
@@ -864,6 +1058,17 @@ async function queryTask(taskId, manual = false) {
     task.message = `暂时无法查询 ComfyUI（第 ${task.failures} 次），任务不会被判定失败，将继续恢复：${error.message}`;
     if (manual) toast(task.message, "error");
   }
+  // 兜底：超过时长上限或连续失败次数上限时停止轮询，避免永久卡在「恢复中」。
+  const stopReason = pollingStopReason(task);
+  if (stopReason) {
+    const wasPolling = state.pollers.has(task.id);
+    stopPolling(task.id);
+    task.status = "failed";
+    task.progress = task.progress || 0;
+    task.message = stopReason;
+    // 只在自动轮询时提示一次，避免手动刷新后反复弹同一个提示。
+    if (wasPolling && !manual) toast(stopReason, "error");
+  }
   persistTasks();
   renderTasks();
 }
@@ -872,6 +1077,9 @@ function startPolling(taskId, immediate = false) {
   stopPolling(taskId);
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task || ["success", "failed"].includes(task.status)) return;
+  // 记录本次轮询的起点（只在首次进入轮询时记，后续 resume 不会重置），
+  // 用于 MAX_POLL_DURATION_MS 的时长兜底。
+  if (!task.pollingSince) task.pollingSince = Date.now();
   if (immediate) queryTask(taskId);
   const timer = setInterval(() => queryTask(taskId), 5000);
   state.pollers.set(taskId, timer);
@@ -881,6 +1089,18 @@ function stopPolling(taskId) {
   const timer = state.pollers.get(taskId);
   if (timer) clearInterval(timer);
   state.pollers.delete(taskId);
+}
+
+// 判断某个仍在轮询的任务是否已经超过兜底阈值。
+// 返回 null 表示继续轮询；返回一段文字表示应当停止，文字用作提示。
+function pollingStopReason(task) {
+  if (task.pollingSince && Date.now() - task.pollingSince > MAX_POLL_DURATION_MS) {
+    return `已连续查询超过 ${Math.round(MAX_POLL_DURATION_MS / 3600000)} 小时仍未取得结果，工作站已停止自动查询。任务可能已在 ComfyUI 中结束或被取消，可点「刷新」手动再查一次。`;
+  }
+  if ((task.failures || 0) >= MAX_QUERY_FAILURES) {
+    return `已连续 ${task.failures} 次无法查询 ComfyUI，工作站已停止自动查询。请确认 ComfyUI 仍在运行且地址正确，然后点「刷新」重试。`;
+  }
+  return null;
 }
 
 function fileViewUrl(task, output) {
@@ -1040,12 +1260,18 @@ function renderTasks() {
   updateTaskElapsedDisplays();
 }
 
+// AI 模型 / 模板下拉在 /api/ai-config 返回前只有 HTML 里的占位项（value 为空串）。
+// 这段期间若调用 saveSettings（loadStoredState 内部的 syncDuration / updateMode 会触发），
+// 已保存的选择会被写成空串，导致每次刷新都回到配置文件里的默认模型。这里暂存原值作为回退，
+// 配置加载成功后由 loadAiPromptConfig 清空。
+let pendingAiSelection = { model: "", template: "" };
+
 function saveSettings() {
   const data = {
     comfyUrl: elements.comfyUrl.value,
     mode: state.mode,
-    aiModel: elements.aiModelSelect.value,
-    aiTemplate: elements.aiTemplateSelect.value,
+    aiModel: elements.aiModelSelect.value || pendingAiSelection.model,
+    aiTemplate: elements.aiTemplateSelect.value || pendingAiSelection.template,
     aiReadImages: elements.aiReadImages.checked,
     duration: clampDuration(elements.durationNumber.value),
     aspectRatio: normalizeAspectRatio(elements.aspectRatio.value),
@@ -1069,6 +1295,24 @@ function saveSettings() {
 }
 
 function persistTasks() {
+  // 先给内存中的任务列表做上限收口：超出 MAX_TASKS_IN_MEMORY 时，从最旧的一端
+  // 丢弃「已结束」的任务（success/failed），活跃任务永不丢弃。
+  // 只在确实超限时才裁剪，避免每次渲染都创建新数组。
+  if (state.tasks.length > MAX_TASKS_IN_MEMORY) {
+    const isActive = (task) => !["success", "failed"].includes(task.status);
+    let overflow = state.tasks.length - MAX_TASKS_IN_MEMORY;
+    // 从尾部（最旧）往前找可丢弃的已结束任务
+    for (let i = state.tasks.length - 1; i >= 0 && overflow > 0; i--) {
+      if (!isActive(state.tasks[i])) {
+        state.tasks.splice(i, 1);
+        overflow--;
+      }
+    }
+    // 若已结束任务不够丢（极端情况：大量任务同时在跑），则不再强裁，保证活跃任务不被误删。
+    if (overflow > 0) {
+      state.tasks = state.tasks.slice(0, MAX_TASKS_IN_MEMORY);
+    }
+  }
   localStorage.setItem(STORAGE_KEYS.tasks, JSON.stringify(state.tasks.slice(0, 30)));
 }
 
@@ -1220,6 +1464,10 @@ function dismissUpdate() {
 function loadStoredState() {
   let settings = {};
   try { settings = JSON.parse(localStorage.getItem(STORAGE_KEYS.settings) || "{}"); } catch {}
+  // 两个 AI 下拉要等 /api/ai-config 返回后才有真实选项，而本函数内部的 syncDuration() / updateMode()
+  // 会调用 saveSettings()——那时下拉里只有占位项（value 为空串），会把已保存的模型/模板选择覆盖掉。
+  // 先把原值暂存在这里，供 saveSettings 在选项未就绪时回退使用。
+  pendingAiSelection = { model: settings.aiModel || "", template: settings.aiTemplate || "" };
   elements.comfyUrl.value = settings.comfyUrl || "http://127.0.0.1:8188";
   elements.aiReadImages.checked = settings.aiReadImages !== false;
   elements.aspectRatio.value = normalizeAspectRatio(settings.aspectRatio);
@@ -1271,6 +1519,12 @@ function loadStoredState() {
       state.tasks = Array.isArray(tasks) ? tasks.map((task) => {
       if (task.finishedAt && !Number.isFinite(Number(task.elapsedMs))) {
         task.elapsedMs = Math.max(0, task.finishedAt - Number(task.startedAt || task.createdAt || task.finishedAt));
+      }
+      // 恢复时重置轮询起点与连续失败计数：
+      // 页面重新打开相当于开启新一轮跟踪，不应继承上次会话的计时，否则会立刻触发超时兜底。
+      if (!["success", "failed"].includes(task.status)) {
+        task.pollingSince = Date.now();
+        task.failures = 0;
       }
       return task;
     }) : [];
@@ -1391,12 +1645,46 @@ function bindEvents() {
     if (!active.length) toast("没有需要恢复查询的任务。");
   });
   elements.clearTasksButton.addEventListener("click", clearCurrentTasks);
+  elements.freeVramButton.addEventListener("click", freeVram);
   elements.checkUpdateButton.addEventListener("click", () => checkUpdate(true));
   elements.applyUpdateButton.addEventListener("click", applyUpdate);
   elements.dismissUpdateButton.addEventListener("click", dismissUpdate);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) state.tasks.filter((task) => !["success", "failed"].includes(task.status)).forEach((task) => queryTask(task.id));
   });
+}
+
+// 【能力探测并发去重】loadCapabilities 有三个触发点（页面加载时的 testConnection、用户点
+// 「测试连接」、以及未来的模式切换），它们可能在同一时刻各发一次 /api/capabilities；
+// 每次请求都会让服务端重新拉一遍 ComfyUI 的 /object_info（几百 KB 且解析开销大）。
+// 这里把"进行中"的请求按 ComfyUI 地址共享，同一地址同一时刻最多一个真实请求。
+// 注意：force（用户手动点测试连接）需要立即生效，因此强制请求不参与复用，
+// 但会用最新结果覆盖缓存，避免随后的非强制请求拿到更旧的数据。
+const capabilityRequests = new Map();
+let lastCapabilityAt = 0;
+const CAPABILITY_MIN_INTERVAL_MS = 3000;
+
+async function loadCapabilities(comfyUrl, force = false) {
+  const key = comfyUrl || "";
+  // 非强制请求在极短时间内重复触发（例如页面加载时 testConnection 与模式同步同时执行）时直接复用。
+  if (!force && Date.now() - lastCapabilityAt < CAPABILITY_MIN_INTERVAL_MS) return null;
+  if (capabilityRequests.has(key)) return capabilityRequests.get(key);
+  const request = (async () => {
+    try {
+      const suffix = force ? "?fresh=1" : "";
+      const caps = await fetchJson(apiUrl("/api/capabilities" + suffix, comfyUrl), {}, 30000);
+      lastCapabilityAt = Date.now();
+      applyCapabilities(caps);
+      return caps;
+    } catch {
+      // 探测失败（例如旧版服务端没有该接口）不影响正常使用：服务端提交时仍会自行降级。
+      return null;
+    } finally {
+      capabilityRequests.delete(key);
+    }
+  })();
+  capabilityRequests.set(key, request);
+  return request;
 }
 
 bindEvents();

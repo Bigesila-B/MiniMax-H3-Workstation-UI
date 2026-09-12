@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260909-1">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260912-3">
   <title>MiniMax H3 视频工作站</title>
 </head>
 <body>
@@ -58,6 +58,7 @@
             </label>
             <button class="button ghost scan-button" id="scanModelsButton" type="button">扫描本地模型</button>
           </div>
+          <p class="config-hint hidden" id="connectionHint"></p>
           <p class="field-help">手机访问时仍可填写 127.0.0.1，工作站服务会从电脑端代理请求，无需浏览器直接连接 ComfyUI。</p>
         </section>
 
@@ -142,7 +143,7 @@
               <span><strong>读取上传图片</strong><small>开启后，AI 会同时分析已上传的首帧与尾帧；全能参考模式下还会读取参考图片。</small></span>
             </label>
           </div>
-          <p class="config-hint">模型 URL、API Key 和提示词模板只从工作流目录下的「AI提示词配置.json」读取，不会发送给浏览器。</p>
+          <p class="config-hint" id="aiPromptHint">模型 URL、API Key 和提示词模板只从工作流目录下的「AI提示词配置.json」读取，不会发送给浏览器。</p>
         </section>
 
         <section class="panel timing-panel">
@@ -157,7 +158,7 @@
               <span>视频时长 <strong id="durationValue">5 秒</strong></span>
               <input id="durationRange" type="range" min="1" max="15" step="1" value="5">
               <input id="durationNumber" type="number" min="1" max="15" step="1" value="5" inputmode="numeric" aria-label="视频时长秒数">
-              <small>支持 1-15 秒；工作流会换算为 H3 支持的最近帧数。</small>
+              <small>支持 1-15 秒，会换算为 H3 合法的 5+17n 帧数。注意模型训练区间约为 5-15 秒（124-362 帧），低于 5 秒画面质量会明显下降。</small>
             </label>
             <label class="field">
               <span>画面比例</span>
@@ -236,7 +237,11 @@
             </label>
             <label class="field">
               <span>采样器</span>
-              <input id="samplerName" type="text" value="res_multistep">
+              <!-- list 指向 scanModels 扫描后动态填充的 datalist：
+                   下拉里是可选项（来自本机 ComfyUI 的真实采样器列表），但仍允许手动输入，
+                   输入不在列表中的名字会在提交时被 ComfyUI 校验拒绝。 -->
+              <input id="samplerName" type="text" value="res_multistep" list="samplerNameOptions" autocomplete="off">
+              <datalist id="samplerNameOptions"></datalist>
             </label>
             <label class="field">
               <span>TE-Speed 控制值</span>
@@ -264,18 +269,23 @@
               <input id="cleanVram" type="checkbox" checked>
               <span class="switch-track" aria-hidden="true"></span>
               <span>
-                <strong>生成后自动清理显存</strong>
-                <small>每个视频合成后执行一次「清理显存占用」（easy cleanGpuUsed），释放 GPU 缓存。关闭后连续生成不再清理，速度可能略快，但显存占用会持续增长。</small>
+                <strong>自动清理显存</strong>
+                <small>视频合成完成后，由网页在任务结束的那一刻自动卸载模型并释放显存；<strong>只在你停留在本页面时生效</strong>。关闭页面或刷新后不会在后台补清理，此时请用下方按钮手动清理。若希望关掉页面也能自动释放显存，请保持本项开启（服务端会在你下次提交任务前补做一次清理）。队列里还有任务在跑或排队时会自动跳过，等最后一个任务结束后再清理，不会打断连续生成。</small>
               </span>
             </label>
+            <div class="vram-clean-action">
+              <button class="button ghost small-button" id="freeVramButton" type="button">立即清理显存</button>
+              <small id="freeVramHint">手动卸载 ComfyUI 占用的模型并释放显存，等效于在 ComfyUI 界面点击「清理显存」。队列有任务时会自动跳过，不打断生成。</small>
+            </div>
             <label class="switch-control rtx-upscale-switch">
               <input id="rtxUpscale" type="checkbox">
               <span class="switch-track" aria-hidden="true"></span>
               <span>
                 <strong>RTX 视频放大（NVIDIA）</strong>
-                <small>视频合成后用 RTX Video Super Resolution 放大画面，音频保持不变。需要 RTX 显卡并安装 ComfyUI 官方 RTX Video 节点包。开启后建议把基础分辨率（百万像素）调低到 0.5 左右，速度更快、等效清晰度更高。</small>
+                <small>视频合成后用 RTX Video Super Resolution 放大画面，音频保持不变。需要 RTX 显卡并安装 ComfyUI 官方 RTX Video 节点包；<strong>未安装时本项会自动禁用并取消勾选</strong>，视频按原分辨率正常输出，不影响出片。<strong>注意：本项同时会作用于本次生成上传的首帧 / 尾帧图片</strong>（图片按同一倍数先放大再送入模型，会更清晰但略微增加显存与耗时）。开启后建议把基础分辨率（百万像素）调低到 0.5 左右，速度更快、等效清晰度更高。</small>
               </span>
             </label>
+            <div class="capability-note hidden" id="capabilityNote" role="status" aria-live="polite"></div>
           </div>
         </details>
 
@@ -323,6 +333,6 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260909-1"></script>
+  <script type="module" src="/assets/workstation.js?v=20260912-3"></script>
 </body>
 </html>

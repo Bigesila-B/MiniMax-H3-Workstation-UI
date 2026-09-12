@@ -348,6 +348,23 @@ body.drag-over::after {
 .vram-clean-switch > span:last-child { display: grid; gap: 3px; }
 .vram-clean-switch strong { color: var(--text); font-size: 13px; }
 .vram-clean-switch small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+/* 显存清理按钮行：与上方开关同宽，按钮在左、说明在右，窄屏自动换行。 */
+.vram-clean-action {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.vram-clean-action > small {
+  flex: 1 1 260px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+.vram-clean-action .button[disabled] { opacity: .65; cursor: progress; }
 .rtx-upscale-switch {
   grid-column: 1 / -1;
   align-items: flex-start;
@@ -462,6 +479,11 @@ body.drag-over::after {
 .status-list { display: grid; gap: 11px; margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 13px; }
 .status-list li { display: flex; align-items: center; gap: 9px; }
 .check-mark { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: #edf8f1; color: var(--success); font-size: 12px; font-weight: 900; }
+
+.capability-note { grid-column: 1 / -1; margin: 0; padding: 10px 12px; border: 1px solid rgba(186,117,23,.35); border-radius: 12px; background: #fdf6e9; color: var(--text); font-size: 12px; line-height: 1.7; }
+.capability-note strong { font-weight: 600; }
+.capability-note ul { margin: 6px 0 0; padding-left: 18px; }
+.capability-note li { margin: 3px 0; }
 
 .toast-region { position: fixed; z-index: 50; right: 18px; bottom: 18px; display: grid; gap: 9px; width: min(380px, calc(100vw - 28px)); pointer-events: none; }
 .toast { padding: 13px 15px; border: 1px solid var(--border-strong); border-radius: 13px; background: rgba(255,255,255,.96); box-shadow: 0 18px 45px rgba(20,22,25,.16); color: var(--text); font-size: 13px; line-height: 1.5; animation: toast-in .2s ease both; }
