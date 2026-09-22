@@ -2469,6 +2469,53 @@ function Get-UpdateInfo {
     $branch = if ([string]$config.'分支') { [string]$config.'分支' } else { 'main' }
     if ($branch -notmatch '^[A-Za-z0-9._\-/]+$') { return @{ configured = $false; reason = '「分支」名称不合法。' } }
 
+    # ---- 优先按 Release tag 判断（根治「回填锚点」导致的永久误报）----
+    # 锚点写在 更新配置.json 里，而“回填锚点”这个动作本身又会产生一个新提交：用 commit SHA
+    # 比较的话，发布者的锚点永远比仓库 HEAD 少一个提交，检查更新必然误报（本项目真实踩坑：
+    # 本地锚点 5a23acc vs 远端 HEAD bdbdea3，远端那个只是回填版本号的元提交）。
+    # 改成比较 Release tag 后：锚点存 tag 名（如 v20260922），发布时打同名 tag，两者相等即
+    # 「已是最新」，彻底打破自引用。仓库没有 Release（或查询失败）时退回旧的 commit 模式，
+    # 兼容老仓库。zipball 接口对 tag 同样有效，下载逻辑无需改动。
+    $releaseInfo = $null
+    try {
+        $relResponse = Invoke-UpdateRequest "https://api.github.com/repos/$repo/releases/latest" 'application/vnd.github+json' 20000
+        if ($relResponse.IsSuccessStatusCode) {
+            $relText = $relResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            $relData = $relText | ConvertFrom-Json
+            if ([string]$relData.tag_name) {
+                $releaseInfo = @{
+                    tag       = [string]$relData.tag_name
+                    name      = [string]$relData.name
+                    url       = [string]$relData.html_url
+                    published = [string]$relData.published_at
+                }
+            }
+        }
+        $relResponse.Dispose()
+    } catch { $releaseInfo = $null }
+
+    if ($releaseInfo) {
+        $tag = $releaseInfo.tag
+        $result = @{
+            configured     = $true
+            channel        = 'release'
+            repo           = $repo
+            branch         = $branch
+            currentVersion = $current
+            currentShort   = $current
+            latestVersion  = $tag
+            latestShort    = $tag
+            latestDate     = $releaseInfo.published
+            commitMessage  = $releaseInfo.name
+            commitUrl      = $releaseInfo.url
+            unversioned    = [string]::IsNullOrWhiteSpace($current)
+            hasUpdate      = ($current -and ($tag -ine $current))
+        }
+        # 结果缓存 30 分钟，避免每次刷新页面都请求 GitHub（匿名额度 60 次/小时）。
+        $script:UpdateCheckCache = @{ At = Get-Date; Data = $result }
+        return $result
+    }
+
     try {
         $response = Invoke-UpdateRequest "https://api.github.com/repos/$repo/commits/$([Uri]::EscapeDataString($branch))" 'application/vnd.github+json' 20000
         $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
