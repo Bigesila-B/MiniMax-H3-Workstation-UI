@@ -3,7 +3,16 @@ const WORKFLOW_FILES = {
   i2v: "minimaxH3图生视频基础加速流.json",
   flf2v: "minimaxH3首尾帧视频基础加速流.json",
   ref2va: "minimaxh3全能参考(图片+视频+音频)+ai提示词生成+加速+Lora.json",
+  director: "minimaxH3长视频导演台加速流.json",
 };
+
+// 长视频导演台的参考图必须落在 ComfyUI input 目录下的这个子文件夹里：
+// timeline_data 的 images[].file 记的就是这个相对路径，服务端照写。
+const DIRECTOR_IMAGE_FOLDER = "minimax_h3_timeline_director";
+// 分段数量上限（含第 1 段）。
+const MAX_DIRECTOR_SEGMENTS = 12;
+// 分段的自增 id 序号（仅用于 DOM 上标 data-segment-id，不参与提交）
+let directorSegmentSeq = 0;
 
 const DEFAULT_MODELS = {
   unet: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
@@ -85,6 +94,8 @@ const state = {
   promptUndoSnapshot: null,
   updateInfo: null,
   updateBusy: false,
+  // 长视频导演台追加的分镜（第 2 段起）。第 1 段始终复用上方的「视频提示词」与「视频时长」。
+  directorSegments: [],
 };
 
 // 任务列表内存上限：超出后从最旧的非活跃任务开始丢弃。
@@ -113,14 +124,24 @@ const elements = {
   durationRange: $("durationRange"), durationNumber: $("durationNumber"), durationValue: $("durationValue"), aspectRatio: $("aspectRatio"), megapixels: $("megapixels"),
   unetModel: $("unetModel"), clipModel: $("clipModel"), videoVae: $("videoVae"), audioVae: $("audioVae"), loraList: $("loraList"), loraEmpty: $("loraEmpty"),
   addLoraButton: $("addLoraButton"), steps: $("steps"), seed: $("seed"), samplerName: $("samplerName"),
-  samplerNameOptions: $("samplerNameOptions"), randomSeedButton: $("randomSeedButton"),
+  samplerNameOptions: $("samplerNameOptions"), samplerNamePicker: $("samplerNamePicker"), samplerNameHint: $("samplerNameHint"), randomSeedButton: $("randomSeedButton"),
   teControl: $("teControl"), tePercent1: $("tePercent1"), tePercent2: $("tePercent2"), cleanVram: $("cleanVram"), freeVramButton: $("freeVramButton"),
+  teMode: $("teMode"), teModeHint: $("teModeHint"),
+  // 长视频导演台
+  directorPanel: $("directorPanel"), directorSummary: $("directorSummary"), segmentList: $("segmentList"),
+  addSegmentButton: $("addSegmentButton"), segmentTotalHint: $("segmentTotalHint"),
+  directorSecondPass: $("directorSecondPass"), directorSecondPassModel: $("directorSecondPassModel"),
+  directorSecondPassSteps: $("directorSecondPassSteps"),
+  timingPanel: $("timingPanel"), durationField: $("durationField"),
+  promptFieldLabel: $("promptFieldLabel"), promptDirectorHint: $("promptDirectorHint"),
   rtxUpscale: $("rtxUpscale"), rtxUpscaleScale: $("rtxUpscaleScale"), capabilityNote: $("capabilityNote"), generationSummary: $("generationSummary"), generateButton: $("generateButton"),
   taskList: $("taskList"), taskEmpty: $("taskEmpty"), refreshTasksButton: $("refreshTasksButton"), clearTasksButton: $("clearTasksButton"), toastRegion: $("toastRegion"),
   checkUpdateButton: $("checkUpdateButton"), updateBanner: $("updateBanner"), updateTitle: $("updateTitle"), updateDetail: $("updateDetail"),
   applyUpdateButton: $("applyUpdateButton"), updateCommitLink: $("updateCommitLink"), dismissUpdateButton: $("dismissUpdateButton"),
-  // 以下两项在 HTML 中缺少 id，这里登记后在启动时补齐，避免文案与样式悄悄失效。
   freeVramHint: $("freeVramHint"), aiPromptHint: $("aiPromptHint"),
+  // 环境自检面板（取代原先写死的「工作流状态」四条 ✓）
+  selfCheckRefresh: $("selfCheckRefresh"), selfCheckSummary: $("selfCheckSummary"),
+  selfCheckModes: $("selfCheckModes"), selfCheckPackages: $("selfCheckPackages"),
 };
 
 function normalizeComfyUrl(value = elements.comfyUrl.value) {
@@ -183,11 +204,300 @@ function syncDuration(value) {
   saveSettings();
 }
 
+// 导演台单段时长 -> 帧数。与服务端 Get-H3FrameCount 是同一套公式：
+// 秒数先按 24fps 折算帧数，再取到 H3 合法的 5+17n 上。
+function h3SegmentFrames(seconds) {
+  return Math.max(5, 5 + Math.round((clampDuration(seconds) * 24 - 5) / 17) * 17);
+}
+
+// 单段实际成片秒数。
+function h3SegmentSeconds(seconds) {
+  return h3SegmentFrames(seconds) / 24;
+}
+
+// 相邻分镜的默认重叠帧数：与节点包 js/segment_windows.mjs 里 createWindows 的
+// overlap 默认值（字面量 39）保持一致。
+const DIRECTOR_SEAM_OVERLAP = 39;
+
+// 复刻节点的 nearestOverlap：候选集 = [0, 1] 加上所有 5+17n，筛掉超过上限的，
+// 取最接近 39 的那个。段很短、上限不足 39 时，重叠会退到 22 / 5 / 1 / 0。
+function nearestSeamOverlap(maximum, target = DIRECTOR_SEAM_OVERLAP) {
+  const choices = [0, 1];
+  for (let i = 0; i < Math.max(0, Math.floor((maximum - 5) / 17) + 1); i++) choices.push(5 + 17 * i);
+  return choices
+    .filter((n) => n <= maximum)
+    .reduce((best, n) => (Math.abs(n - target) < Math.abs(best - target) ? n : best), 0);
+}
+
+// 分镜布局：逐段算出 startFrame / endFrame。**必须与服务端 Build-DirectorWorkflow
+// 的帧范围算法保持一致**——两边都按「相邻段重叠 39 帧（首段从 0 起）」排布，
+// 否则界面上的「共约 X 秒」会和实际成片时长对不上。
+function directorSegmentsLayout() {
+  const layout = [];
+  state.directorSegments.forEach((segment, index) => {
+    const frames = h3SegmentFrames(segment.duration);
+    if (index === 0) {
+      layout.push({ frames, start: 0, end: frames });
+      return;
+    }
+    const previous = layout[index - 1];
+    const maximum = Math.min(frames, previous.frames) - 1;
+    const overlap = maximum >= 0 ? nearestSeamOverlap(maximum) : 0;
+    const start = previous.end - overlap;
+    layout.push({ frames, start, end: start + frames });
+  });
+  return layout;
+}
+
+// 分段总数：导演台至少保留一段。列表里就是全部段——第 1 段也在其中，
+// 不再是"复用上方提示词框"的特殊段（这样才能给每一段单独选参考素材）。
+function directorSegmentCount() {
+  return state.directorSegments.length;
+}
+
+function directorTotalSeconds() {
+  // 总长取「最后一段的结束帧 ÷ 24」，而不是各段秒数直接相加 ——
+  // 相邻段重叠 39 帧，直接相加会把重叠部分重复计算。
+  const layout = directorSegmentsLayout();
+  if (!layout.length) return 0;
+  return Math.round((layout[layout.length - 1].end / 24) * 100) / 100;
+}
+
+// 「全局提示词 / 分段提示词」的互斥关系，语义照抄素材规划台：
+//   * 每一段提示词都留空 -> 全局提示词生效，并复用到每一段；
+//   * 只要有任何一段填了 -> 全局提示词不生效，且要求每一段都补齐。
+// 返回 "global" | "segment" | "incomplete"。
+function directorPromptMode() {
+  const segments = state.directorSegments;
+  if (!segments.length) return "global";
+  const filled = segments.filter((item) => String(item.prompt || "").trim()).length;
+  if (filled === 0) return "global";
+  if (filled === segments.length) return "segment";
+  return "incomplete";
+}
+
+// 把互斥关系实时显示在提示词框下方（文案改写自素材规划台的 globalPromptHint / globalPromptInactive）。
+function updateDirectorPromptHint() {
+  const hint = elements.promptDirectorHint;
+  if (!hint) return;
+  if (state.mode !== "director") {
+    hint.classList.add("hidden");
+    return;
+  }
+  const mode = directorPromptMode();
+  hint.classList.remove("hidden");
+  if (mode === "global") {
+    hint.textContent = "全局提示词生效中：所有分段提示词都为空，它会复用到每一段。";
+  } else if (mode === "segment") {
+    hint.textContent = "各分段都已有自己的提示词，全局提示词不生效。";
+  } else {
+    hint.textContent = "已有分段提示词，全局提示词不生效；请补全每一段提示词，或把这些分段清空以改用全局提示词。";
+  }
+  hint.classList.toggle("director-hint-warn", mode === "incomplete");
+}
+
 function updateSummary() {
-  const modeLabels = { t2v: "文生视频", i2v: "图生视频", flf2v: "首尾帧视频", ref2va: "全能参考视频" };
+  const modeLabels = { t2v: "文生视频", i2v: "图生视频", flf2v: "首尾帧视频", ref2va: "全能参考视频", director: "长视频导演台" };
   const ratio = elements.aspectRatio.value.split(" ")[0];
+  if (state.mode === "director") {
+    const total = directorTotalSeconds();
+    const count = directorSegmentCount();
+    elements.generationSummary.textContent = `${modeLabels.director} · ${count} 段 · 共约 ${total} 秒 · ${ratio}`;
+    if (elements.directorSummary) {
+      elements.directorSummary.textContent = `${count} 段 · 共约 ${total} 秒`;
+    }
+    if (elements.segmentTotalHint) {
+      elements.segmentTotalHint.textContent = `当前 ${count} 段 · 共约 ${total} 秒`;
+    }
+    updateDirectorPromptHint();
+    return;
+  }
   elements.generationSummary.textContent = `${modeLabels[state.mode]} · ${clampDuration(elements.durationNumber.value)} 秒 · ${ratio}`;
 }
+
+// ---------------------------------------------------------------- 长视频导演台：分镜
+// 第 1 段固定复用上方的「视频提示词」与「视频时长」，这里只维护第 2 段及以后的追加分镜。
+// 每段单独生成再交给导演台拼接，所以「长视频」= 各段时长累加；单段（不追加）时行为与普通模式一致。
+
+function createDirectorSegment(prompt = "", duration = 5) {
+  directorSegmentSeq += 1;
+  return {
+    id: `director-seg-${directorSegmentSeq}`,
+    prompt: String(prompt || ""),
+    duration: clampDuration(duration),
+    // 该段引用的参考素材（按文件名记录）。null = 引用全部（之后新增的素材自动包含），
+    // 数组 = 只引用列出的这些；空数组表示这一段不引用任何同类素材。
+    imageNames: null,
+    audioNames: null,
+  };
+}
+
+// 每段的参考素材勾选器：候选来自上方「参考素材」区已上传的文件。
+// 与服务端约定用「文件名」关联——服务端登记素材时也记 name，最后映射成 timeline_data 里的 id。
+function segmentMaterialPicker(kind, segment) {
+  const isImage = kind === "image";
+  const pool = isImage ? state.referenceImages : state.referenceAudios;
+  const key = isImage ? "imageNames" : "audioNames";
+  const field = document.createElement("div");
+  field.className = "field segment-materials";
+  const title = document.createElement("span");
+  title.textContent = isImage ? "本段参考图片" : "本段参考音频";
+  field.appendChild(title);
+
+  if (!pool.length) {
+    const empty = document.createElement("small");
+    empty.textContent = isImage
+      ? "先在上方「参考素材」里添加图片，再回到这里勾选本段要用的。"
+      : "先在上方「参考素材」里添加音频，再回到这里勾选本段要用的。";
+    field.appendChild(empty);
+    return field;
+  }
+
+  const list = document.createElement("div");
+  list.className = "segment-material-options";
+  const chosen = Array.isArray(segment[key]) ? segment[key] : null;
+
+  pool.forEach((file) => {
+    const item = document.createElement("label");
+    item.className = "segment-material-option";
+    item.title = file.name;
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = file.name;
+    box.checked = chosen === null || chosen.includes(file.name);
+
+    // 预览小图：图片直接读本地文件生成 object URL；音频没有画面，用音符占位。
+    // object URL 记在 data 上，renderDirectorSegments 重建前统一 revoke（否则每次重建都漏一个）。
+    const thumb = document.createElement("span");
+    thumb.className = "segment-material-thumb";
+    if (isImage) {
+      const preview = document.createElement("img");
+      const objectUrl = URL.createObjectURL(file);
+      preview.src = objectUrl;
+      preview.alt = "";
+      thumb.dataset.previewUrl = objectUrl;
+      thumb.appendChild(preview);
+    } else {
+      thumb.classList.add("is-audio");
+      thumb.textContent = "♪";
+    }
+    box.addEventListener("change", () => {
+      const boxes = Array.from(list.querySelectorAll("input"));
+      const checked = boxes.filter((node) => node.checked).map((node) => node.value);
+      // 三种状态要分清楚，和服务端一一对应（素材规划台本身允许一段不引用任何素材）：
+      //   全勾   -> null   ：未指定，引用全部，且以后新增的素材自动包含
+      //   部分勾 -> 具体名单
+      //   全不勾 -> 空数组 ：显式声明"这一段不引用任何同类素材"
+      segment[key] = checked.length === pool.length ? null : checked;
+      saveSettings();
+    });
+    const text = document.createElement("span");
+    text.className = "segment-material-name";
+    text.textContent = file.name;
+    item.append(box, thumb, text);
+    list.appendChild(item);
+  });
+
+  field.appendChild(list);
+  const hint = document.createElement("small");
+  hint.textContent = "全选 = 引用所有素材（含以后新增的）；全不选 = 这一段不引用任何素材。";
+  field.appendChild(hint);
+  return field;
+}
+
+function directorSegmentCard(segment, index) {
+  const row = document.createElement("div");
+  row.className = "segment-row";
+  row.dataset.segmentId = segment.id;
+
+  const head = document.createElement("div");
+  head.className = "segment-row-head";
+  const label = document.createElement("span");
+  label.className = "segment-index";
+  label.textContent = `第 ${index + 1} 段`;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "remove-segment";
+  remove.textContent = "移除";
+  remove.addEventListener("click", () => {
+    state.directorSegments = state.directorSegments.filter((item) => item.id !== segment.id);
+    // 至少保留一段，否则提交时没有任何分段可展开。
+    if (!state.directorSegments.length) state.directorSegments.push(createDirectorSegment());
+    renderDirectorSegments();
+    saveSettings();
+  });
+  head.append(label, remove);
+
+  const body = document.createElement("div");
+  body.className = "segment-row-body";
+
+  const promptField = document.createElement("label");
+  promptField.className = "field";
+  const promptLabel = document.createElement("span");
+  promptLabel.textContent = "本段提示词";
+  const promptInput = document.createElement("textarea");
+  promptInput.rows = 4;
+  promptInput.maxLength = 12000;
+  promptInput.placeholder = "留空则整条时间线共用上方的「全局提示词」。";
+  promptInput.value = segment.prompt;
+  promptInput.addEventListener("input", () => {
+    segment.prompt = promptInput.value;
+    updateDirectorPromptHint();
+    saveSettings();
+  });
+  promptField.append(promptLabel, promptInput);
+
+  const durationField = document.createElement("label");
+  durationField.className = "field";
+  const durationLabel = document.createElement("span");
+  durationLabel.textContent = "时长（秒）";
+  const durationInput = document.createElement("input");
+  durationInput.type = "number";
+  durationInput.min = "1";
+  durationInput.max = "15";
+  durationInput.step = "1";
+  durationInput.inputMode = "numeric";
+  durationInput.value = String(segment.duration);
+  durationInput.addEventListener("input", () => {
+    segment.duration = clampDuration(durationInput.value);
+    updateSummary();
+    saveSettings();
+  });
+  durationField.append(durationLabel, durationInput);
+
+  body.append(promptField, durationField, segmentMaterialPicker("image", segment), segmentMaterialPicker("audio", segment));
+  row.append(head, body);
+  return row;
+}
+
+function renderDirectorSegments() {
+  if (!elements.segmentList) return;
+  // 至少保留一段：分段列表为空时导演台没有任何可展开的内容。
+  if (!state.directorSegments.length) state.directorSegments.push(createDirectorSegment());
+  // 先回收上一轮为素材预览创建的 blob URL —— 分段卡会随素材增删/模式切换频繁重建，
+  // 不回收的话每重建一次就漏一批（图片缩略图每张一个）。
+  elements.segmentList.querySelectorAll("[data-preview-url]").forEach((node) => {
+    URL.revokeObjectURL(node.dataset.previewUrl);
+  });
+  elements.segmentList.replaceChildren();
+  state.directorSegments.forEach((segment, index) => {
+    elements.segmentList.appendChild(directorSegmentCard(segment, index));
+  });
+  updateSummary();
+}
+
+function addDirectorSegment() {
+  if (state.directorSegments.length >= MAX_DIRECTOR_SEGMENTS) {
+    return toast(`最多 ${MAX_DIRECTOR_SEGMENTS} 段。`, "error");
+  }
+  state.directorSegments.push(createDirectorSegment());
+  renderDirectorSegments();
+  saveSettings();
+  const lastCard = elements.segmentList?.lastElementChild;
+  if (lastCard) lastCard.querySelector("textarea")?.focus();
+}
+
+elements.addSegmentButton?.addEventListener("click", addDirectorSegment);
 
 function updateMode(mode) {
   const previousMode = state.mode;
@@ -203,9 +513,24 @@ function updateMode(mode) {
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
   });
-  elements.imageUploadArea.classList.toggle("hidden", mode === "t2v" || mode === "ref2va");
+  elements.imageUploadArea.classList.toggle("hidden", mode === "t2v" || mode === "ref2va" || mode === "director");
   elements.lastFrameCard.classList.toggle("hidden", mode !== "flf2v");
-  elements.referenceUploadArea?.classList.toggle("hidden", mode !== "ref2va");
+  // 导演台与全能参考共用「参考素材」区；导演台当前只取其中的图片（见下方提示）。
+  elements.referenceUploadArea?.classList.toggle("hidden", mode !== "ref2va" && mode !== "director");
+  // 导演台与全能参考一样支持图片 / 视频 / 音频三类参考素材，参考区不区分显示。
+  const directorMode = mode === "director";
+  elements.directorPanel?.classList.toggle("hidden", !directorMode);
+  // 导演台的时长全部由各分段决定，顶部的「视频时长」不再适用；
+  // 主提示词框在导演台里的语义是「全局提示词」（与分段提示词互斥，见 updateDirectorPromptHint）。
+  elements.durationField?.classList.toggle("hidden", directorMode);
+  elements.timingPanel?.classList.toggle("director-mode", directorMode);
+  if (elements.promptFieldLabel) {
+    elements.promptFieldLabel.textContent = directorMode ? "全局提示词" : "提示词或简短创意";
+  }
+  elements.promptInput.placeholder = directorMode
+    ? "整条时间线的整体描述。所有分段提示词都留空时，它会复用到每一段。"
+    : "可以输入简单想法，再点击 AI 生成提示词；也可以直接填写最终视频提示词。";
+  renderDirectorSegments();
   updateSummary();
   saveSettings();
 }
@@ -381,6 +706,62 @@ function collectSamplerNames(objectInfo) {
   return findNodeOptions(objectInfo, SAMPLER_NODE_CLASSES, ["sampler_name"]);
 }
 
+// 本机采样器候选的最近一次结果：输入框被手动编辑时要重新判断「这个名字本机到底有没有」，
+// 不能为此再去重扫一遍 ComfyUI。
+let samplerNameCache = [];
+
+// 输入框里填的采样器不在本机列表时给出提示。
+// 只提示、不强行改值——用户可能有意使用自定义节点提供的采样器，替用户改掉更糟。
+function markSamplerValidity(names) {
+  const input = elements.samplerName;
+  if (!input) return;
+  const list = Array.isArray(names) ? names : [];
+  const current = input.value.trim();
+  if (list.length && current && !list.includes(current)) {
+    input.title = `当前填写的「${current}」不在本机采样器列表中，提交可能失败。可从右侧下拉里选择。`;
+  } else {
+    input.removeAttribute("title");
+  }
+}
+
+// 下拉是「选择动作」而不是状态显示：选完立刻回到占位项。
+// 为什么不复读输入框的值：左边本来就是同一个值的输入框，右边再显示一遍会看起来像两个重复控件，
+// 而且下拉的宽度会把输入框挤窄。保持「选择…」既省空间，也让「点了会弹出列表」这件事一目了然。
+// 附带好处：连续选同一个采样器两次也能各触发一次 change（value 每次都从占位项变过去）。
+function resetSamplerPicker() {
+  const picker = elements.samplerNamePicker;
+  if (picker) picker.value = "";
+}
+
+// 把本机 ComfyUI 的真实采样器列表填进右侧下拉。
+// 为什么不能只靠 <datalist>：它在不少浏览器里不点那个极小的箭头就不弹列表，用户根本发现不了；
+// 显式的 <select> 一眼就知道「这里能选」。datalist 仍然保留，手打时有自动补全。
+// 列表为空（还没扫描过模型 / ComfyUI 没起来）时禁用下拉，避免点开一个空菜单。
+function applySamplerPicker(names) {
+  const picker = elements.samplerNamePicker;
+  if (!picker) return;
+  samplerNameCache = [...new Set((names || []).filter((item) => typeof item === "string" && item.trim()))];
+
+  picker.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = samplerNameCache.length ? "选择…" : "（先扫描模型）";
+  picker.appendChild(placeholder);
+  samplerNameCache.forEach((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    picker.appendChild(option);
+  });
+  picker.disabled = samplerNameCache.length === 0;
+  if (elements.samplerNameHint) {
+    elements.samplerNameHint.textContent = samplerNameCache.length
+      ? `下拉里是本机 ComfyUI 现有的 ${samplerNameCache.length} 个采样器；也可以在左边直接输入其它名称。`
+      : "下拉列表取自本机 ComfyUI（点「扫描模型」后填充）。也可以直接在左边输入其它采样器名。";
+  }
+  resetSamplerPicker();
+}
+
 function getDefaultLora() {
   const preferred = state.mode === "ref2va" ? DEFAULT_MODELS.ref2vaLora : DEFAULT_MODELS.lora;
   return findModelName(state.models.lora, preferred);
@@ -429,6 +810,9 @@ async function testConnection(showSuccess = true) {
     // 而不是等用户提交后才从错误里知道（服务端同样会自动降级，双保险）。
     // 手动点「测试连接」时强制重新探测，方便刚装完节点包后立刻生效。
     await loadCapabilities(comfyUrl, showSuccess);
+    // 顺带刷新环境自检面板：它复用服务端刚探测好的能力缓存，不额外打 ComfyUI。
+    // loadSelfCheck 内部已自行兜底，失败不会冒泡到这里、不影响连接结果。
+    loadSelfCheck(comfyUrl, showSuccess);
     if (showSuccess) toast("ComfyUI 连接成功。", "success");
     saveSettings();
     return true;
@@ -477,6 +861,59 @@ const CAPABILITY_ITEMS = [
 
 // loadCapabilities 带并发去重的实现放在文件末尾（见「能力探测并发去重」注释）。
 
+// TE-Speed 加速模式的显示名。值本身照读节点声明，这里只把已知的值翻成人话；
+// 节点若声明了这里没有登记的模式，直接显示原始值——绝不因为前端没登记就丢掉一个选项。
+const TESPEED_MODE_LABELS = {
+  "standard": "standard（长采样加速）",
+  "4-step LoRA": "4-step LoRA（4 步蒸馏）",
+  "8-step LoRA": "8-step LoRA（8 步蒸馏）",
+};
+// 记录 HTML 里的原始说明文案：节点不支持 mode 时会被替换成解释性文案，恢复时要还原。
+const TESPEED_MODE_HINT_DEFAULT = elements.teModeHint ? elements.teModeHint.innerHTML : "";
+
+// 用节点当前声明的 mode 候选重建下拉。
+// 为什么不写死在 HTML 里：mode 是 TE-Speed 3.5 才引入的，以后还可能加新模式（比如 16 步），
+// 写死的话上游每改一次都要跟着改前端。这里完全跟随 /api/capabilities 回传的 TEspeedModes。
+// 候选为空有两种情况——节点版本太旧（没有 mode 输入）或压根没装 TE-Speed——都禁用下拉，
+// 避免用户以为切换生效了，实际却被节点静默忽略。
+function applyTespeedModes(modes) {
+  const select = elements.teMode;
+  if (!select) return;
+  const list = Array.isArray(modes) ? modes.filter((item) => typeof item === "string" && item) : [];
+  const current = select.value || "standard";
+  const hint = elements.teModeHint;
+
+  if (!list.length) {
+    select.disabled = true;
+    select.replaceChildren();
+    const option = document.createElement("option");
+    // 保留原值：服务端仍会收到它，并在节点确实不支持时给出明确提示，而不是静默丢弃用户的选择。
+    option.value = current;
+    option.textContent = "（当前节点版本不支持选择）";
+    select.appendChild(option);
+    if (hint) {
+      hint.textContent = "当前 TE-Speed 节点没有 mode 输入（3.5 以前的版本），加速策略由节点按采样步数自行切换。安装 TE-Speed 3.5 及以上版本并重启 ComfyUI 后本项会自动启用。";
+      hint.dataset.unsupported = "1";
+    }
+    return;
+  }
+
+  select.disabled = false;
+  select.replaceChildren();
+  list.forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = TESPEED_MODE_LABELS[value] || value;
+    select.appendChild(option);
+  });
+  // 存过的值在当前节点上不存在时回退到第一项（节点把最保守的选项排在第一位）。
+  select.value = list.includes(current) ? current : list[0];
+  if (hint && hint.dataset.unsupported === "1") {
+    hint.innerHTML = TESPEED_MODE_HINT_DEFAULT;
+    delete hint.dataset.unsupported;
+  }
+}
+
 function applyCapabilities(caps) {
   if (!caps) return;
   const missing = CAPABILITY_ITEMS.filter(([key]) => caps[key] === false).map(([, , , text]) => text);
@@ -489,6 +926,9 @@ function applyCapabilities(caps) {
     elements.rtxUpscale.checked = false;
     saveSettings();
   }
+
+  // TE-Speed 加速模式：候选列表与可用性完全由节点声明决定（见 applyTespeedModes）。
+  applyTespeedModes(caps.TEspeedModes);
 
   const note = elements.capabilityNote;
   if (!note) return;
@@ -509,19 +949,259 @@ function applyCapabilities(caps) {
   note.classList.remove("hidden");
 }
 
+// ---------------------------------------------------------------- 环境自检面板
+
+// 模式状态 -> 中文标签。服务端给的是 ok / degraded / unavailable 三种。
+// 措辞刻意避开「会降级」这类读起来像「不能用」的说法 —— 降级仍然照常出片。
+const SELF_CHECK_STATE_TEXT = { ok: "正常", degraded: "有降级", unavailable: "不可用" };
+
+// 把某模式的缺失节点拼成一段说明，用作悬停提示。
+function selfCheckMissingText(mode) {
+  const describe = (entry) => `${entry.node}（${entry.impact}）`;
+  const lines = [];
+  if (mode.requiredMissing?.length) lines.push(`必需缺失：${mode.requiredMissing.map(describe).join("；")}`);
+  if (mode.optionalMissing?.length) lines.push(`可选缺失：${mode.optionalMissing.map(describe).join("；")}`);
+  return lines.join("\n");
+}
+
+// 一键安装一个节点包：转发给 ComfyUI-Manager。请求体只带**包名** ——
+// 仓库地址由服务端从登记表反查，前端无法指定任意 URL（这是有意的安全设计）。
+async function installPackage(pkg, button) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "安装中…";
+  try {
+    // 超时给到 10 分钟：Manager 需要克隆仓库并可能装 pip 依赖。
+    const result = await fetchJson(apiUrl("/api/install-package"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ package: pkg.package }),
+    }, 600000);
+    toast(`${result.message || `已提交 ${pkg.package} 的安装。`}装好后点「重新检测」。`, "success");
+  } catch (error) {
+    // 安装失败是常见路径而不是异常：Manager 没开 allow_git_url_install、
+    // ComfyUI 不是以 loopback 启动、版本过旧都会走到这里。服务端已经把原因
+    // 翻译成人话并附带手动安装指引，直接原样显示即可。
+    toast(error.message || "一键安装失败，请改用「复制安装命令」手动安装。", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+// 一个「待安装节点包」卡片：包名 + 缺失节点 + 安装操作。
+function selfCheckPackageCard(pkg, manager) {
+  const box = document.createElement("div");
+  box.className = `self-check-package${pkg.isCore ? " is-core" : ""}`;
+
+  const name = document.createElement("strong");
+  name.className = "self-check-package-name";
+  // 内置节点不是「装包」能解决的，必须说清是升级 ComfyUI。
+  name.textContent = pkg.isCore ? "ComfyUI 内置节点缺失" : String(pkg.package || "未登记来源");
+
+  const nodes = document.createElement("p");
+  nodes.className = "self-check-package-nodes";
+  nodes.textContent = `缺失：${(pkg.nodes || []).join("、")}`;
+  box.append(name, nodes);
+
+  if (pkg.isCore) {
+    const hint = document.createElement("p");
+    hint.className = "self-check-hint";
+    hint.textContent = "这些节点由较新版本 ComfyUI 内置，请更新 ComfyUI 后重启。";
+    box.appendChild(hint);
+    return box;
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "self-check-package-actions";
+
+  if (pkg.url) {
+    const command = `git clone ${pkg.url}`;
+    // 检测到 ComfyUI-Manager 才显示「一键安装」；没装就保持「复制安装命令」。
+    // 两个按钮都保留：一键安装会因 Manager 的配置（allow_git_url_install /
+    // security_level / ComfyUI 非 loopback 启动）失败，这时手动命令是兜底路径。
+    if (manager?.available) {
+      const install = document.createElement("button");
+      install.type = "button";
+      install.className = "button primary";
+      install.textContent = "一键安装";
+      install.addEventListener("click", () => installPackage(pkg, install));
+      actions.appendChild(install);
+    }
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "button ghost";
+    copy.textContent = "复制安装命令";
+    copy.addEventListener("click", async () => {
+      try {
+        // 剪贴板 API 只在安全上下文可用（localhost / HTTPS）。用局域网 IP 访问工作站时
+        // 会拿不到 writeText，这时退化成把命令显示出来让用户手抄，而不是静默什么都不做。
+        await navigator.clipboard.writeText(command);
+        toast("安装命令已复制。请在 ComfyUI 的 custom_nodes 目录下执行，装完重启 ComfyUI。", "success");
+      } catch {
+        toast(`请手动执行：${command}（在 ComfyUI 的 custom_nodes 目录下），装完重启 ComfyUI。`, "error");
+      }
+    });
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "button ghost";
+    open.textContent = "打开仓库";
+    open.addEventListener("click", () => window.open(pkg.url, "_blank", "noopener"));
+    actions.append(copy, open);
+  } else {
+    const hint = document.createElement("p");
+    hint.className = "self-check-hint";
+    hint.textContent = `未登记仓库地址，请在 ComfyUI-Manager 中搜索「${pkg.package}」安装。`;
+    box.appendChild(hint);
+  }
+
+  if (actions.childElementCount) box.appendChild(actions);
+  return box;
+}
+
+function renderSelfCheck(report) {
+  const summary = elements.selfCheckSummary;
+  const modeList = elements.selfCheckModes;
+  const packageBox = elements.selfCheckPackages;
+  if (!summary || !modeList || !packageBox) return;
+
+  if (!report) {
+    summary.textContent = "自检数据暂不可用（不影响生成）。";
+    modeList.replaceChildren();
+    packageBox.replaceChildren();
+    return;
+  }
+
+  // 「连不上 ComfyUI」与「缺节点」必须分开说 —— 都报红的话用户会以为节点装崩了。
+  if (report.connected === false) {
+    summary.replaceChildren();
+    const bad = document.createElement("strong");
+    bad.className = "is-bad";
+    bad.textContent = "未连接到 ComfyUI";
+    const detail = document.createElement("span");
+    detail.textContent = `　${report.error || "请确认 ComfyUI 已启动，然后点「重新检测」。"}`;
+    summary.append(bad, detail);
+    modeList.replaceChildren();
+    packageBox.replaceChildren();
+    return;
+  }
+
+  const stats = report.summary || {};
+  summary.replaceChildren();
+  const badge = (cls, text) => {
+    const el = document.createElement("span");
+    el.className = cls;
+    el.textContent = text;
+    return el;
+  };
+  summary.append(document.createTextNode(`${stats.modes || 0} 个模式：`));
+  summary.append(badge("is-ok", `${stats.available || 0} 正常`));
+  if (stats.degraded) summary.append(document.createTextNode(" · "), badge("is-soft", `${stats.degraded} 有降级`));
+  if (stats.unavailable) summary.append(document.createTextNode(" · "), badge("is-bad", `${stats.unavailable} 不可用`));
+
+  modeList.replaceChildren();
+  (report.modes || []).forEach((mode) => {
+    const item = document.createElement("li");
+    item.className = `self-check-mode is-${mode.status}`;
+    const name = document.createElement("span");
+    name.className = "self-check-mode-name";
+    name.textContent = mode.label;
+    const state = document.createElement("span");
+    state.className = "self-check-mode-state";
+    state.textContent = SELF_CHECK_STATE_TEXT[mode.status] || mode.status;
+    const detail = selfCheckMissingText(mode);
+    if (detail) item.title = detail;
+    item.append(name, state);
+    modeList.appendChild(item);
+  });
+
+  packageBox.replaceChildren();
+  // 先讲清「降级 ≠ 不能用」：否则只缺一个 RTX 放大就会让五个模式全变黄，
+  // 用户会以为环境装坏了。这也点明了本面板是只读诊断、不拦生成。
+  if (stats.degraded || stats.unavailable) {
+    const note = document.createElement("p");
+    note.className = "self-check-hint";
+    note.textContent = stats.unavailable
+      ? "缺「必需」节点会让对应模式不可用；缺「可选」节点只会降级，仍会正常出片。"
+      : "缺「可选」节点只会降级，仍会正常出片。";
+    packageBox.appendChild(note);
+  }
+  const packages = report.packages || [];
+  const unknown = report.unknownNodes || [];
+  if (!packages.length) {
+    const ok = document.createElement("p");
+    ok.className = "self-check-hint";
+    ok.textContent = "五个模式所需节点齐全，无需安装。";
+    packageBox.appendChild(ok);
+  } else {
+    const head = document.createElement("p");
+    head.className = "self-check-hint";
+    head.textContent = "需要安装的节点包：";
+    packageBox.appendChild(head);
+    const manager = report.manager || { available: false };
+    packages.forEach((pkg) => packageBox.appendChild(selfCheckPackageCard(pkg, manager)));
+  }
+  if (unknown.length) {
+    const hint = document.createElement("p");
+    hint.className = "self-check-hint";
+    hint.textContent = `另有未登记来源的缺失节点：${unknown.join("、")}（请在 ComfyUI-Manager 中按节点名搜索）。`;
+    packageBox.appendChild(hint);
+  }
+}
+
+// 拉取并渲染自检结果。失败只让面板显示中性提示，绝不影响生成流程 ——
+// 与 loadCapabilities 的容错策略一致：旧版服务端没有这个接口时应当静默降级。
+async function loadSelfCheck(comfyUrl, force = false) {
+  if (!elements.selfCheckSummary) return null;
+  try {
+    const suffix = force ? "?fresh=1" : "";
+    const report = await fetchJson(apiUrl("/api/self-check" + suffix, comfyUrl), {}, 30000);
+    renderSelfCheck(report);
+    return report;
+  } catch {
+    renderSelfCheck(null);
+    return null;
+  }
+}
+
 // 服务端在构建工作流时若跳过了可选节点，会在提交结果里带上 warnings。
-// 这里只弹一条简短汇总，逐条原因已经常驻显示在「高级参数」的兼容性提示里。
+// 分两类处理：
+//   1) 能力降级类（「未检测到 XXX 节点」）——汇总成一条。逐条原因已常驻在「高级参数」的
+//      兼容性提示里，弹一条就够，不然会刷屏；
+//   2) 其它提示（例如「已自动补齐必需输入」「选定的加速模式被旧版节点忽略」）——这些
+//      没有常驻展示位置，必须原样弹出来，否则用户根本不会知道发生过什么。
+//
+// 【为什么按前缀而不是整段子串匹配】原先用 `text.includes(marker)` 找 CAPABILITY_ITEMS 的节点名，
+// 但自动补齐的告警里会拼进**节点类名**（例如「…自动补齐必需输入：CreateVideo.fps=24」），
+// 而 marker 里恰好也有一堆类名（CreateVideo / SaveVideo / ResolutionSelector…）→ 会把
+// 「补齐了输入」误报成「本次已自动跳过：视频合成」，语义完全错，还会把排查方向带偏。
+// 服务端的降级告警都固定以「未检测到」开头（见 server.ps1 的 Add-BuildWarning 调用点），
+// 用它做闸门既准确又不用和文案细节耦合。
+const CAPABILITY_WARNING_PREFIX = "未检测到";
 function reportBuildWarnings(warnings) {
   if (!Array.isArray(warnings) || !warnings.length) return;
   const labels = [];
-  CAPABILITY_ITEMS.forEach(([, marker, label]) => {
-    if (warnings.some((text) => String(text).includes(marker)) && !labels.includes(label)) labels.push(label);
+  const details = [];
+  warnings.forEach((raw) => {
+    const text = String(raw);
+    if (!text.startsWith(CAPABILITY_WARNING_PREFIX)) {
+      details.push(text);
+      return;
+    }
+    const matched = CAPABILITY_ITEMS
+      .filter(([, marker]) => text.includes(marker))
+      .map(([, , label]) => label);
+    if (!matched.length) {
+      // 以「未检测到」开头但前端没登记该节点：仍然原样弹出，不能因为没登记就把它吞掉。
+      details.push(text);
+      return;
+    }
+    matched.forEach((label) => { if (!labels.includes(label)) labels.push(label); });
   });
-  toast(
-    labels.length
-      ? `本次已自动跳过：${labels.join("、")}。原因见「高级参数」里的兼容性提示。`
-      : "本次生成已自动跳过部分可选功能，原因见「高级参数」里的兼容性提示。"
-  );
+  if (labels.length) {
+    toast(`本次已自动跳过：${labels.join("、")}。原因见「高级参数」里的兼容性提示。`);
+  }
+  details.forEach((text) => toast(text));
 }
 
 async function scanModels() {
@@ -552,15 +1232,11 @@ async function scanModels() {
     // 这样用户从下拉里选就不会填出不存在的采样器名，从而避免提交后被 ComfyUI 校验拒绝。
     // 注意：只是「候选项」，输入框仍允许手动输入其它值。
     const samplerNames = collectSamplerNames(objectInfo);
-    if (fillDatalist(elements.samplerNameOptions, samplerNames) > 0) {
-      // 若当前保存的采样器在新列表里不存在，给出提示但不强改（用户可能有意使用自定义值）。
-      const current = elements.samplerName.value.trim();
-      if (current && !samplerNames.includes(current)) {
-        elements.samplerName.title = `当前填写的「${current}」不在本机采样器列表中，提交可能失败。可从下拉列表中选择。`;
-      } else {
-        elements.samplerName.removeAttribute("title");
-      }
-    }
+    fillDatalist(elements.samplerNameOptions, samplerNames);
+    // 下拉与 datalist 一起填；若当前保存的采样器不在新列表里，只提示不强改
+    // （用户可能有意使用自定义节点提供的采样器）。
+    applySamplerPicker(samplerNames);
+    markSamplerValidity(samplerNames);
     // 扫描后把旧保存的 LoRA 名归一化成当前库里的名字（文件可能被移入了子文件夹）。
     state.loras = state.loraModeDefaults
       ? []
@@ -660,6 +1336,61 @@ async function uploadImage(file) {
   return result.name || result.filename;
 }
 
+// 读取媒体时长（视频 / 音频）。浏览器读不出 metadata 时返回 0，服务端照常登记这条素材。
+function loadMediaDuration(file) {
+  return new Promise((resolve) => {
+    const isVideo = file.type.startsWith("video/");
+    const node = document.createElement(isVideo ? "video" : "audio");
+    const objectUrl = URL.createObjectURL(file);
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      URL.revokeObjectURL(objectUrl);
+      resolve(value);
+    };
+    node.preload = "metadata";
+    node.onloadedmetadata = () => finish(Number.isFinite(node.duration) ? Math.round(node.duration * 1000) / 1000 : 0);
+    node.onerror = () => finish(0);
+    // 兜底：部分编码浏览器读不出 metadata，别让上传流程卡在这里。
+    setTimeout(() => finish(0), 2500);
+    node.src = objectUrl;
+  });
+}
+
+// 长视频导演台的参考素材要落进 input 下的子目录（timeline_data 里记的就是这个相对路径），
+// 并按类型回传时间线需要的附加字段：图片给宽高，视频 / 音频给时长。
+async function uploadDirectorAsset(file, subfolder) {
+  const form = new FormData();
+  form.append("image", file, file.name);
+  form.append("type", "input");
+  form.append("overwrite", "true");
+  form.append("subfolder", subfolder);
+  const result = await fetchJson(apiUrl("/api/upload"), { method: "POST", body: form }, 300000);
+  const name = result.name || result.filename;
+  const folder = result.subfolder != null && result.subfolder !== "" ? result.subfolder : subfolder;
+  const payload = { file: `${folder}/${name}` };
+  if (file.type.startsWith("image/")) {
+    try {
+      const dimensions = await loadImageDimensions(file);
+      payload.width = dimensions.width;
+      payload.height = dimensions.height;
+    } catch {
+      // 浏览器读不出尺寸（特殊编码）时留空，服务端照样登记这条参考素材。
+    }
+  } else {
+    const seconds = await loadMediaDuration(file);
+    if (seconds > 0) {
+      payload.duration = seconds;
+    } else {
+      // 绝不传 0：节点侧会把 duration<=0 的参考视频整条丢弃（静默、无报错）。
+      // 服务端会兜底成 5 秒，但截取范围会偏短，所以这里明确告诉用户换文件。
+      toast(`没能读出「${file.name}」的时长，已按 5 秒计入参考（可能只截取开头一段）。换成标准编码的 MP4 可以避免。`, "error");
+    }
+  }
+  return payload;
+}
+
 async function uploadReferenceFile(file) {
   // 工作站服务沿用当前项目已有的图片上传代理；参考素材仍写入 ComfyUI input 目录。
   const form = new FormData();
@@ -692,7 +1423,7 @@ async function validateReferenceFiles(requireVisual = true) {
   const audios = state.referenceAudios;
   const total = images.length + videos.length + audios.length;
   // 全能参考按官方端口能力保留 9 张图片、3 段视频和 3 段音频；全部素材合计最多 12 个。
-  if (images.length > 9) throw new Error("全能参考模式最多上传 9 张图片。");
+  if (images.length > 9) throw new Error("参考图片最多 9 张，请先移除多余的图片。");
   if (videos.length > 3) throw new Error("全能参考模式最多上传 3 段视频。");
   if (audios.length > 3) throw new Error("全能参考模式最多上传 3 段音频。");
   if (total > 12) throw new Error("图片、视频和音频参考素材合计不能超过 12 个。");
@@ -767,6 +1498,8 @@ function renderReferenceFiles() {
       remove.addEventListener("click", () => {
         state[type === "images" ? "referenceImages" : type === "videos" ? "referenceVideos" : "referenceAudios"].splice(index, 1);
         renderReferenceFiles();
+        // 素材池变了：导演台分段里的素材勾选器要跟着重建，被删掉的文件不再出现在候选里。
+        renderDirectorSegments();
       });
 
       item.append(preview, info, remove);
@@ -804,6 +1537,8 @@ async function setReferenceFiles(type, files) {
   // 清空原生文件选择器，确保下次选择同一个文件时仍能触发 change 事件。
   if (input) input.value = "";
   renderReferenceFiles();
+  // 新增素材后重建导演台分段卡，让「本段参考图片 / 音频」的候选项立即出现。
+  renderDirectorSegments();
 }
 
 function randomSeed() {
@@ -840,9 +1575,26 @@ function buildGenerationConfig() {
     teControl: Number(elements.teControl.value),
     tePercent1: Number(elements.tePercent1.value),
     tePercent2: Number(elements.tePercent2.value),
+    // 加速模式：节点没有 mode 输入时下拉被禁用并保留原值，服务端会按节点实际能力判断是否采纳。
+    teMode: elements.teMode ? elements.teMode.value : "",
     cleanVram: elements.cleanVram.checked,
     rtxUpscale: elements.rtxUpscale.checked,
     rtxUpscaleScale: Math.max(1, Math.min(4, Math.round(Number(elements.rtxUpscaleScale.value) || 2))),
+    // ---- 长视频导演台专用（只有 director 模式会被服务端读取）----
+    // 主提示词框在导演台里是「全局提示词」：所有分段提示词都为空时由服务端复用到每一段。
+    // 分段整份带过去（含提示词为空的），由服务端的同一套互斥规则决定用哪一套。
+    directorGlobalPrompt: state.mode === "director" ? elements.promptInput.value.trim() : "",
+    directorSegments: state.directorSegments.map((item) => ({
+      prompt: String(item.prompt || "").trim(),
+      duration: clampDuration(item.duration),
+      imageNames: Array.isArray(item.imageNames) ? item.imageNames : null,
+      audioNames: Array.isArray(item.audioNames) ? item.audioNames : null,
+    })),
+    directorSecondPass: elements.directorSecondPass ? elements.directorSecondPass.checked : true,
+    directorSecondPassModel: elements.directorSecondPassModel ? elements.directorSecondPassModel.value.trim() : "",
+    directorSecondPassSteps: elements.directorSecondPassSteps
+      ? Math.max(1, Math.min(10, Number(elements.directorSecondPassSteps.value) || 2))
+      : 2,
   };
 }
 
@@ -862,13 +1614,26 @@ async function generate() {
   const missingModels = requiredModels.filter(([, name]) => !name).map(([label]) => label);
   if (missingModels.length) return toast(`请先扫描并选择可用模型：${missingModels.join("、")}。`, "error");
   if (!config.prompt) return toast("请先填写视频提示词。", "error");
-  if (state.mode !== "t2v" && state.mode !== "ref2va" && !state.firstFrame) return toast("当前模式需要上传首帧图片。", "error");
+  const needsFirstFrame = !["t2v", "ref2va", "director"].includes(state.mode);
+  if (needsFirstFrame && !state.firstFrame) return toast("当前模式需要上传首帧图片。", "error");
   if (state.mode === "flf2v" && !state.lastFrame) return toast("首尾帧模式还需要上传尾帧图片。", "error");
-  if (state.mode === "ref2va") {
+  if (state.mode === "ref2va" || state.mode === "director") {
     try {
       await validateReferenceFiles();
     } catch (error) {
       return toast(error.message, "error");
+    }
+  }
+  if (state.mode === "director") {
+    // 参考素材至少要有一种画面来源（图片或视频）——这一条已由上面的 validateReferenceFiles 保证。
+    // 提示词按「全局 / 分段」的互斥规则校验，与素材规划台的语义一致。
+    const promptMode = directorPromptMode();
+    if (promptMode === "global" && !elements.promptInput.value.trim()) {
+      return toast("请填写「全局提示词」，或给每一段分别填写提示词。", "error");
+    }
+    if (promptMode === "incomplete") {
+      const emptyIndex = state.directorSegments.findIndex((item) => !String(item.prompt || "").trim());
+      return toast(`第 ${emptyIndex + 1} 段还没填提示词：要么把每段都补全，要么把所有分段的提示词清空、改用全局提示词。`, "error");
     }
   }
 
@@ -885,6 +1650,22 @@ async function generate() {
       for (const file of state.referenceImages) config.referenceImages.push(await uploadImage(file));
       for (const file of state.referenceVideos) config.referenceVideos.push(await uploadReferenceFile(file));
       for (const file of state.referenceAudios) config.referenceAudios.push(await uploadReferenceFile(file));
+    }
+    if (state.mode === "director") {
+      // 三类参考素材都落进同一个子目录，服务端按类型分别组装成
+      // timeline_data 的 images[] / videoClips[] / audios[]。
+      config.directorImages = [];
+      config.directorVideos = [];
+      config.directorAudios = [];
+      for (const file of state.referenceImages) {
+        config.directorImages.push(await uploadDirectorAsset(file, DIRECTOR_IMAGE_FOLDER));
+      }
+      for (const file of state.referenceVideos) {
+        config.directorVideos.push(await uploadDirectorAsset(file, DIRECTOR_IMAGE_FOLDER));
+      }
+      for (const file of state.referenceAudios) {
+        config.directorAudios.push(await uploadDirectorAsset(file, DIRECTOR_IMAGE_FOLDER));
+      }
     }
 
     const comfyUrl = normalizeComfyUrl();
@@ -1287,6 +2068,11 @@ function saveSettings() {
     teControl: elements.teControl.value,
     tePercent1: elements.tePercent1.value,
     tePercent2: elements.tePercent2.value,
+    teMode: elements.teMode ? elements.teMode.value : "",
+    directorSegments: state.directorSegments,
+    directorSecondPass: elements.directorSecondPass ? elements.directorSecondPass.checked : true,
+    directorSecondPassModel: elements.directorSecondPassModel ? elements.directorSecondPassModel.value : "",
+    directorSecondPassSteps: elements.directorSecondPassSteps ? elements.directorSecondPassSteps.value : "2",
     cleanVram: elements.cleanVram.checked,
     rtxUpscale: elements.rtxUpscale.checked,
     rtxUpscaleScale: elements.rtxUpscaleScale.value,
@@ -1477,9 +2263,31 @@ function loadStoredState() {
   elements.teControl.value = settings.teControl || "0.12";
   elements.tePercent1.value = settings.tePercent1 || "0.1";
   elements.tePercent2.value = settings.tePercent2 || "0.9";
+  // 存过的模式先写回下拉（此处 HTML 里已有兜底选项）；等 /api/capabilities 回来后会按
+  // 节点真实声明的候选重建，届时若该值已不存在会自动回退到第一项。
+  if (elements.teMode && settings.teMode) elements.teMode.value = settings.teMode;
   elements.cleanVram.checked = settings.cleanVram !== false;
   elements.rtxUpscale.checked = settings.rtxUpscale === true;
   elements.rtxUpscaleScale.value = ["1", "2", "3", "4"].includes(String(settings.rtxUpscaleScale)) ? String(settings.rtxUpscaleScale) : "2";
+  // 长视频导演台：恢复追加的分镜与二采超分设置（分镜卡片由 updateMode → renderDirectorSegments 渲染）
+  state.directorSegments = Array.isArray(settings.directorSegments)
+    ? settings.directorSegments
+        .filter((item) => item && typeof item.prompt === "string")
+        .slice(0, MAX_DIRECTOR_SEGMENTS)
+        .map((item) => {
+          const segment = createDirectorSegment(item.prompt, item.duration);
+          segment.imageNames = Array.isArray(item.imageNames) ? item.imageNames : null;
+          segment.audioNames = Array.isArray(item.audioNames) ? item.audioNames : null;
+          return segment;
+        })
+    : [];
+  if (elements.directorSecondPass) elements.directorSecondPass.checked = settings.directorSecondPass !== false;
+  if (elements.directorSecondPassModel) {
+    elements.directorSecondPassModel.value = settings.directorSecondPassModel || "minimax_h3_latent_upscaler_3d_bf16.safetensors";
+  }
+  if (elements.directorSecondPassSteps) {
+    elements.directorSecondPassSteps.value = settings.directorSecondPassSteps || "2";
+  }
   state.loras = Array.isArray(settings.loras) && settings.loras.length
     ? settings.loras.map((lora) => ({
         name: lora.name,
@@ -1553,8 +2361,9 @@ function setupDropZone(element, onFiles) {
 }
 
 function routeDroppedFiles(files) {
-  // 按当前模式把拖入的文件自动归类：全能参考按图片/视频/音频分桶，图生/首尾帧取图片。
-  if (state.mode === "ref2va") {
+  // 按当前模式把拖入的文件自动归类：全能参考按图片/视频/音频分桶，图生/首尾帧取图片，
+  // 长视频导演台按图片分桶（当前只把图片写进 timeline_data）。
+  if (state.mode === "ref2va" || state.mode === "director") {
     const images = files.filter((file) => file.type.startsWith("image/"));
     const videos = files.filter((file) => file.type.startsWith("video/"));
     const audios = files.filter((file) => file.type.startsWith("audio/"));
@@ -1577,11 +2386,22 @@ function routeDroppedFiles(files) {
     }
     return;
   }
-  toast("文生视频模式不使用素材文件；图生视频/首尾帧可拖入图片，全能参考可拖入图片、视频、音频。", "error");
+  toast("文生视频模式不使用素材文件；图生视频/首尾帧可拖入图片，全能参考可拖入图片、视频、音频，长视频导演台可拖入图片。", "error");
 }
 
 function bindEvents() {
   elements.testConnectionButton.addEventListener("click", () => testConnection());
+  // 「重新检测」= 强制重新探测（fresh=1），供用户刚装完节点包时立刻看到变化。
+  if (elements.selfCheckRefresh) {
+    elements.selfCheckRefresh.addEventListener("click", async () => {
+      elements.selfCheckRefresh.disabled = true;
+      try {
+        await loadSelfCheck(normalizeComfyUrl(), true);
+      } finally {
+        elements.selfCheckRefresh.disabled = false;
+      }
+    });
+  }
   elements.scanModelsButton.addEventListener("click", scanModels);
   elements.modeControl.addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
@@ -1606,7 +2426,21 @@ function bindEvents() {
   elements.durationNumber.addEventListener("change", () => syncDuration(elements.durationNumber.value));
   elements.aspectRatio.addEventListener("change", () => { updateSummary(); saveSettings(); });
   elements.megapixels.addEventListener("change", saveSettings);
-  [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.tePercent1, elements.tePercent2, elements.cleanVram, elements.rtxUpscale, elements.rtxUpscaleScale, elements.comfyUrl].forEach((element) => element.addEventListener("change", saveSettings));
+  [elements.unetModel, elements.clipModel, elements.videoVae, elements.audioVae, elements.steps, elements.samplerName, elements.teControl, elements.teMode, elements.tePercent1, elements.tePercent2, elements.cleanVram, elements.rtxUpscale, elements.rtxUpscaleScale, elements.comfyUrl].forEach((element) => element && element.addEventListener("change", saveSettings));
+  // 采样器：右边下拉是「从本机列表里挑」的动作入口，左边输入框负责自由填写。
+  elements.samplerNamePicker?.addEventListener("change", () => {
+    const value = elements.samplerNamePicker.value;
+    if (!value) return;
+    elements.samplerName.value = value;
+    resetSamplerPicker();
+    markSamplerValidity(samplerNameCache);
+    updateSummary();
+    saveSettings();
+  });
+  // 手打采样器名时即时判断这个名字本机到底有没有，并给出提示。
+  elements.samplerName.addEventListener("input", () => {
+    markSamplerValidity(samplerNameCache);
+  });
   elements.addLoraButton.addEventListener("click", () => {
     if (!state.models.lora.length) return toast("请先扫描到至少一个本地 LoRA。", "error");
     state.loraModeDefaults = false;

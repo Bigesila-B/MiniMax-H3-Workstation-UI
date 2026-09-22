@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260912-3">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20260921-12">
   <title>MiniMax H3 视频工作站</title>
 </head>
 <body>
@@ -74,6 +74,7 @@
             <button type="button" class="segment" data-mode="i2v" role="tab" aria-selected="false">图生视频</button>
             <button type="button" class="segment" data-mode="flf2v" role="tab" aria-selected="false">首尾帧</button>
             <button type="button" class="segment" data-mode="ref2va" role="tab" aria-selected="false">全能参考</button>
+            <button type="button" class="segment" data-mode="director" role="tab" aria-selected="false">长视频导演台</button>
           </div>
 
           <div class="upload-grid hidden" id="imageUploadArea">
@@ -99,14 +100,14 @@
             <div class="reference-heading">
               <div>
                 <strong>参考素材（可选组合）</strong>
-                <small>图片最多 9 张；视频最多 3 段；音频最多 3 段；全部参考素材合计最多 12 个。</small>
+                <small id="referenceHeadingHint">图片最多 9 张；视频最多 3 段；音频最多 3 段；全部参考素材合计最多 12 个。</small>
               </div>
-              <span class="reference-limit">图片/视频至少一种 · 支持 9 图片 / 3 视频 / 3 音频 / 总数 12</span>
+              <span class="reference-limit" id="referenceLimitBadge">图片/视频至少一种 · 支持 9 图片 / 3 视频 / 3 音频 / 总数 12</span>
             </div>
             <div class="reference-input-grid">
               <label class="reference-picker"><input id="referenceImagesInput" type="file" accept="image/png,image/jpeg,image/webp" multiple><strong>添加图片</strong><small>单张 ≤ 30MB</small></label>
-              <label class="reference-picker"><input id="referenceVideosInput" type="file" accept="video/mp4,video/webm,video/quicktime" multiple><strong>添加视频</strong><small>单段 ≤ 50MB</small></label>
-              <label class="reference-picker"><input id="referenceAudiosInput" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4" multiple><strong>添加音频</strong><small>单段 ≤ 15MB</small></label>
+              <label class="reference-picker" id="referenceVideosPicker"><input id="referenceVideosInput" type="file" accept="video/mp4,video/webm,video/quicktime" multiple><strong>添加视频</strong><small>单段 ≤ 50MB</small></label>
+              <label class="reference-picker" id="referenceAudiosPicker"><input id="referenceAudiosInput" type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4" multiple><strong>添加音频</strong><small>单段 ≤ 15MB</small></label>
             </div>
             <div class="reference-file-list" id="referenceImagesList"></div>
             <div class="reference-file-list" id="referenceVideosList"></div>
@@ -124,7 +125,7 @@
             <button class="button primary ai-generate-button" id="generateAiPromptButton" type="button">AI 生成提示词</button>
           </div>
           <label class="field">
-            <span>提示词或简短创意</span>
+            <span id="promptFieldLabel">提示词或简短创意</span>
             <textarea id="promptInput" rows="7" maxlength="12000" placeholder="可以输入简单想法，再点击 AI 生成提示词；也可以直接填写最终视频提示词。"></textarea>
             <span class="textarea-meta"><span>AI 生成结果会直接覆盖并填入这个提示词框；模型拒答或想改输入时，点右下角「撤回」可恢复生成前的内容。</span><span class="textarea-meta-right"><button class="prompt-undo-button hidden" id="promptUndoButton" type="button" title="撤回到 AI 生成前的提示词">↩ 撤回</button><span id="promptCount">0 / 12000</span></span></span>
           </label>
@@ -143,10 +144,11 @@
               <span><strong>读取上传图片</strong><small>开启后，AI 会同时分析已上传的首帧与尾帧；全能参考模式下还会读取参考图片。</small></span>
             </label>
           </div>
+          <p class="config-hint hidden" id="promptDirectorHint"></p>
           <p class="config-hint" id="aiPromptHint">模型 URL、API Key 和提示词模板只从工作流目录下的「AI提示词配置.json」读取，不会发送给浏览器。</p>
         </section>
 
-        <section class="panel timing-panel">
+        <section class="panel timing-panel" id="timingPanel">
           <div class="section-heading">
             <div>
               <span class="eyebrow">时长与画面</span>
@@ -154,7 +156,7 @@
             </div>
           </div>
           <div class="settings-grid three-columns">
-            <label class="field duration-field">
+            <label class="field duration-field" id="durationField">
               <span>视频时长 <strong id="durationValue">5 秒</strong></span>
               <input id="durationRange" type="range" min="1" max="15" step="1" value="5">
               <input id="durationNumber" type="number" min="1" max="15" step="1" value="5" inputmode="numeric" aria-label="视频时长秒数">
@@ -180,6 +182,48 @@
             </label>
           </div>
         </section>
+
+        <details class="panel collapsible-panel hidden" id="directorPanel">
+          <summary>
+            <span><span class="eyebrow">导演台</span><strong>分镜编排与二采超分</strong></span>
+            <span class="summary-note" id="directorSummary">单段 · 5 秒</span>
+          </summary>
+          <div class="details-content advanced-params">
+            <p class="field-help">参考素材沿用上方「参考素材」区；画面比例与分辨率沿用「基础生成参数」（这份工作流原设定为 1.5 MP，可按需调整）。</p>
+            <div class="param-group">
+              <div class="param-group-head"><span class="param-group-title">分段编排</span></div>
+              <p class="field-help">每段可单独设置提示词、时长，以及<strong>该段引用哪几项参考素材</strong>，由导演台逐段生成后首尾相接拼成长视频；每段仍受 1–15 秒（5+17n 帧）限制。若每段提示词都留空，则统一使用上方的「全局提示词」。</p>
+              <div class="segment-list" id="segmentList"></div>
+              <div class="segment-actions">
+                <button class="button secondary small-button" id="addSegmentButton" type="button">+ 添加分段</button>
+                <small id="segmentTotalHint">当前 1 段 · 共约 5.2 秒</small>
+              </div>
+            </div>
+            <div class="param-group">
+              <div class="param-group-head"><span class="param-group-title">二采超分</span></div>
+              <div class="param-grid cols-2">
+                <label class="switch-control director-secondpass-switch">
+                  <input id="directorSecondPass" type="checkbox" checked>
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>
+                    <strong>二次采样超分（secondPass）</strong>
+                    <small>主采样结束后再用 latent 超分模型跑一遍高步数精修，画面更锐利、耗时更长。关掉则按单次采样出片。</small>
+                  </span>
+                </label>
+                <label class="field">
+                  <span>超分模型</span>
+                  <input id="directorSecondPassModel" type="text" value="minimax_h3_latent_upscaler_3d_bf16.safetensors" autocomplete="off" placeholder="minimax_h3_latent_upscaler_3d_bf16.safetensors">
+                  <small>填 ComfyUI 里的模型文件名；不确定就保持默认。</small>
+                </label>
+                <label class="field">
+                  <span>二采高步数</span>
+                  <input id="directorSecondPassSteps" type="number" min="1" max="10" step="1" value="2" inputmode="numeric">
+                  <small>secondPassHighSteps，1–10，默认 2。</small>
+                </label>
+              </div>
+            </div>
+          </div>
+        </details>
 
         <details class="panel collapsible-panel" open>
           <summary>
@@ -223,68 +267,113 @@
             <span><span class="eyebrow">高级参数</span><strong>采样与 TE-Speed</strong></span>
             <span class="summary-note">使用当前目录加速链</span>
           </summary>
-          <div class="details-content settings-grid three-columns">
-            <label class="field">
-              <span>采样步数</span>
-              <input id="steps" type="number" min="1" max="50" value="8" inputmode="numeric">
-            </label>
-            <label class="field">
-              <span>随机种子</span>
-              <div class="input-with-button">
-                <input id="seed" type="number" min="0" value="-1" inputmode="numeric">
-                <button id="randomSeedButton" type="button" class="icon-button" title="生成随机种子">随机</button>
+          <div class="details-content advanced-params">
+            <!-- ===== 采样 ===== -->
+            <div class="param-group">
+              <div class="param-group-head"><span class="param-group-title">采样</span></div>
+              <div class="param-grid cols-3">
+                <label class="field">
+                  <span>采样步数</span>
+                  <input id="steps" type="number" min="1" max="50" value="8" inputmode="numeric">
+                </label>
+                <label class="field">
+                  <span>随机种子</span>
+                  <div class="input-with-button">
+                    <input id="seed" type="number" min="0" value="-1" inputmode="numeric">
+                    <button id="randomSeedButton" type="button" class="icon-button" title="生成随机种子">随机</button>
+                  </div>
+                </label>
+                <label class="field">
+                  <span>采样器</span>
+                  <!-- 两种选择方式并存：
+                       左边输入框可直接手写任意采样器名（保留原来的用法，自定义节点提供的采样器也能用）；
+                       右边下拉列出本机 ComfyUI 真实拥有的采样器，选中即回填到输入框，
+                       避免手打错名字导致提交被 ComfyUI 拒绝。
+                       下拉候选项与 datalist 共用同一次「扫描模型」的结果，不额外发请求。 -->
+                  <div class="input-with-button">
+                    <input id="samplerName" type="text" value="res_multistep" list="samplerNameOptions" autocomplete="off" placeholder="可直接输入名称">
+                    <select id="samplerNamePicker" class="sampler-picker" title="从本机 ComfyUI 的采样器列表中选择">
+                      <option value="">选择…</option>
+                    </select>
+                  </div>
+                  <datalist id="samplerNameOptions"></datalist>
+                  <small id="samplerNameHint">下拉列表取自本机 ComfyUI（点「扫描模型」后填充）。也可以直接在左边输入其它采样器名。</small>
+                </label>
               </div>
-            </label>
-            <label class="field">
-              <span>采样器</span>
-              <!-- list 指向 scanModels 扫描后动态填充的 datalist：
-                   下拉里是可选项（来自本机 ComfyUI 的真实采样器列表），但仍允许手动输入，
-                   输入不在列表中的名字会在提交时被 ComfyUI 校验拒绝。 -->
-              <input id="samplerName" type="text" value="res_multistep" list="samplerNameOptions" autocomplete="off">
-              <datalist id="samplerNameOptions"></datalist>
-            </label>
-            <label class="field">
-              <span>TE-Speed 控制值</span>
-              <input id="teControl" type="number" min="0" max="1" step="0.01" value="0.12">
-            </label>
-            <label class="field">
-              <span>加速区间起点</span>
-              <input id="tePercent1" type="number" min="0" max="1" step="0.05" value="0.1">
-            </label>
-            <label class="field">
-              <span>加速区间终点</span>
-              <input id="tePercent2" type="number" min="0" max="1" step="0.05" value="0.9">
-            </label>
-            <label class="field">
-              <span>RTX 放大倍数</span>
-              <select id="rtxUpscaleScale">
-                <option value="1">1 倍（仅画质增强）</option>
-                <option value="2" selected>2 倍</option>
-                <option value="3">3 倍</option>
-                <option value="4">4 倍</option>
-              </select>
-              <small>仅在开启下方 RTX 放大开关后生效，1-4 倍。</small>
-            </label>
-            <label class="switch-control vram-clean-switch">
-              <input id="cleanVram" type="checkbox" checked>
-              <span class="switch-track" aria-hidden="true"></span>
-              <span>
-                <strong>自动清理显存</strong>
-                <small>视频合成完成后，由网页在任务结束的那一刻自动卸载模型并释放显存；<strong>只在你停留在本页面时生效</strong>。关闭页面或刷新后不会在后台补清理，此时请用下方按钮手动清理。若希望关掉页面也能自动释放显存，请保持本项开启（服务端会在你下次提交任务前补做一次清理）。队列里还有任务在跑或排队时会自动跳过，等最后一个任务结束后再清理，不会打断连续生成。</small>
-              </span>
-            </label>
-            <div class="vram-clean-action">
-              <button class="button ghost small-button" id="freeVramButton" type="button">立即清理显存</button>
-              <small id="freeVramHint">手动卸载 ComfyUI 占用的模型并释放显存，等效于在 ComfyUI 界面点击「清理显存」。队列有任务时会自动跳过，不打断生成。</small>
             </div>
-            <label class="switch-control rtx-upscale-switch">
-              <input id="rtxUpscale" type="checkbox">
-              <span class="switch-track" aria-hidden="true"></span>
-              <span>
-                <strong>RTX 视频放大（NVIDIA）</strong>
-                <small>视频合成后用 RTX Video Super Resolution 放大画面，音频保持不变。需要 RTX 显卡并安装 ComfyUI 官方 RTX Video 节点包；<strong>未安装时本项会自动禁用并取消勾选</strong>，视频按原分辨率正常输出，不影响出片。<strong>注意：本项同时会作用于本次生成上传的首帧 / 尾帧图片</strong>（图片按同一倍数先放大再送入模型，会更清晰但略微增加显存与耗时）。开启后建议把基础分辨率（百万像素）调低到 0.5 左右，速度更快、等效清晰度更高。</small>
-              </span>
-            </label>
+            <!-- ===== TE-Speed 加速 ===== -->
+            <div class="param-group">
+              <div class="param-group-head"><span class="param-group-title">TE-Speed 加速</span></div>
+              <div class="param-grid cols-2">
+                <label class="field">
+                  <span>TE-Speed 加速模式</span>
+                  <!-- 这里的三项只是「服务端能力还没探测回来」时的兜底；真正的候选项由 JS 按
+                       /api/capabilities 回传的 TEspeedModes 重建（照读节点自己声明的 mode 候选），
+                       这样上游 TE-Speed 以后新增模式时前端自动跟随，不需要改前端代码。 -->
+                  <select id="teMode">
+                    <option value="standard" selected>standard（长采样加速）</option>
+                    <option value="4-step LoRA">4-step LoRA（4 步蒸馏）</option>
+                    <option value="8-step LoRA">8-step LoRA（8 步蒸馏）</option>
+                  </select>
+                  <small id="teModeHint">决定 TE-Speed 内部走哪套加速策略，要和当前 LoRA 的蒸馏步数对应。<strong>用 4 步 / 8 步蒸馏 LoRA 时必须对应选择</strong>，选错会明显影响画面与音频特征；用普通 Turbo LoRA 或长采样时保持 standard。<strong>需要 TE-Speed 3.5 及以上版本</strong>，旧版节点没有这个输入，本项会自动禁用并提示。</small>
+                </label>
+                <label class="field">
+                  <span>TE-Speed 控制值</span>
+                  <input id="teControl" type="number" min="0" max="1" step="0.01" value="0.12">
+                </label>
+                <label class="field">
+                  <span>加速区间起点</span>
+                  <input id="tePercent1" type="number" min="0" max="1" step="0.05" value="0.1">
+                </label>
+                <label class="field">
+                  <span>加速区间终点</span>
+                  <input id="tePercent2" type="number" min="0" max="1" step="0.05" value="0.9">
+                </label>
+              </div>
+            </div>
+            <!-- ===== 画质增强 ===== -->
+            <div class="param-group">
+              <div class="param-group-head"><span class="param-group-title">画质增强</span></div>
+              <div class="param-grid cols-2">
+                <label class="field">
+                  <span>RTX 放大倍数</span>
+                  <select id="rtxUpscaleScale">
+                    <option value="1">1 倍（仅画质增强）</option>
+                    <option value="2" selected>2 倍</option>
+                    <option value="3">3 倍</option>
+                    <option value="4">4 倍</option>
+                  </select>
+                  <small>仅在开启右侧 RTX 放大开关后生效，1-4 倍。</small>
+                </label>
+                <label class="switch-control rtx-upscale-switch">
+                  <input id="rtxUpscale" type="checkbox">
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>
+                    <strong>RTX 视频放大（NVIDIA）</strong>
+                    <small>视频合成后用 RTX Video Super Resolution 放大画面，音频保持不变。需要 RTX 显卡并安装 ComfyUI 官方 RTX Video 节点包；<strong>未安装时本项会自动禁用并取消勾选</strong>，视频按原分辨率正常输出，不影响出片。<strong>注意：本项同时会作用于本次生成上传的首帧 / 尾帧图片</strong>（图片按同一倍数先放大再送入模型，会更清晰但略微增加显存与耗时）。开启后建议把基础分辨率（百万像素）调低到 0.5 左右，速度更快、等效清晰度更高。</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <!-- ===== 显存管理 ===== -->
+            <div class="param-group">
+              <div class="param-group-head"><span class="param-group-title">显存管理</span></div>
+              <div class="param-grid">
+                <label class="switch-control vram-clean-switch">
+                  <input id="cleanVram" type="checkbox" checked>
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>
+                    <strong>自动清理显存</strong>
+                    <small>视频合成完成后，由网页在任务结束的那一刻自动卸载模型并释放显存；<strong>只在你停留在本页面时生效</strong>。关闭页面或刷新后不会在后台补清理，此时请用下方按钮手动清理。若希望关掉页面也能自动释放显存，请保持本项开启（服务端会在你下次提交任务前补做一次清理）。队列里还有任务在跑或排队时会自动跳过，等最后一个任务结束后再清理，不会打断连续生成。</small>
+                  </span>
+                </label>
+                <div class="vram-clean-action">
+                  <button class="button ghost small-button" id="freeVramButton" type="button">立即清理显存</button>
+                  <small id="freeVramHint">手动卸载 ComfyUI 占用的模型并释放显存，等效于在 ComfyUI 界面点击「清理显存」。队列有任务时会自动跳过，不打断生成。</small>
+                </div>
+              </div>
+            </div>
             <div class="capability-note hidden" id="capabilityNote" role="status" aria-live="polite"></div>
           </div>
         </details>
@@ -319,20 +408,22 @@
         </section>
 
         <section class="panel workflow-status-panel">
-          <span class="eyebrow">工作流状态</span>
-          <h2>当前目录加速流</h2>
-          <ul class="status-list">
-            <li><span class="check-mark">✓</span><span>三个模式分别读取本地 JSON</span></li>
-            <li><span class="check-mark">✓</span><span>TE-SpeedMiniMaxH3 加速节点</span></li>
-            <li><span class="check-mark">✓</span><span>LoRA Manager 模型链</span></li>
-            <li><span class="check-mark">✓</span><span>独立 AI 提示词服务，不阻断视频生成</span></li>
-          </ul>
+          <div class="self-check-head">
+            <div>
+              <span class="eyebrow">环境自检</span>
+              <h2>节点与依赖</h2>
+            </div>
+            <button type="button" class="button ghost small-button" id="selfCheckRefresh">重新检测</button>
+          </div>
+          <p class="self-check-summary" id="selfCheckSummary">正在读取 ComfyUI 节点列表…</p>
+          <ul class="self-check-modes" id="selfCheckModes"></ul>
+          <div class="self-check-packages" id="selfCheckPackages"></div>
         </section>
       </aside>
     </main>
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260912-3"></script>
+  <script type="module" src="/assets/workstation.js?v=20260921-12"></script>
 </body>
 </html>

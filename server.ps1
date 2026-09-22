@@ -34,6 +34,20 @@ $script:CapabilityCache = @{}
 # 与 CapabilityCache 分开：前者回答"节点在不在"，这里回答"节点跑不跑得起来"。
 $script:RtxVfxCache = @{}
 
+# 单节点定义缓存（键为 "ComfyUI地址|节点名"），存 /object_info/<节点名> 返回的 input.required 等定义。
+# 用途见 Complete-RequiredInputs：提交前按 ComfyUI 当前实际节点定义补齐缺失的必需输入，
+# 这样上游节点包升级后新增必需字段（例如 TE-Speed 3.5 新增 mode）也不会让整单生成失败。
+$script:NodeSchemaCache = @{}
+
+# 节点定义缓存的存活时间。
+# 【为什么成功和失败要用两套 TTL】探测失败（ComfyUI 刚重启、正在扫模型、网络抖动）如果也按
+# 10 分钟缓存 $null，整个兼容层就会在最需要它的时候静默失效：用户看到的是 ComfyUI 的
+# required_input_missing，根本想不到是工作站这边的缓存，而唯一的手动刷新入口是网页上的「测试连接」，
+# 谁也不会为一个"节点明明装好了"的问题去点它。30 秒足以避免「节点确实不存在」时每次提交都重试，
+# 又不会把一次抖动放大成 10 分钟。
+$script:NodeSchemaTtlMinutes = 10
+$script:NodeSchemaNegativeTtlSeconds = 30
+
 # 本次构建产生的降级提示（例如缺少 RTX 节点而跳过放大）。每次构建前清空，构建后随响应回给网页。
 $script:BuildWarnings = @()
 
@@ -517,21 +531,45 @@ function Convert-UiWorkflowToApi {
         }
     }
     $api = [ordered]@{}
+    # 【节点的输入有两条来源，必须都取】
+    # ComfyUI 0.4 导出的工作流里，`inputs` 数组**不一定包含 widget**：
+    # 纯 widget、没有任何连线的节点（UNETLoader / CLIPLoader / BasicScheduler /
+    # KSamplerSelect 等）的 `inputs` 干脆是空数组，它们的参数只存在于 `widgets_values_named`。
+    # 只按 `inputs` 枚举的话，这些节点的参数会整个丢失（实测 BasicScheduler 的
+    # scheduler="simple" 与 denoise=1 就是这么丢的，补默认值后会悄悄变成 normal）。
+    # 所以分两步：① 按 inputs 的 link 建立连线；② 从 widgets_values_named 把
+    # 「没有被连线覆盖」的参数逐个补上。两路合起来才等于节点的完整输入。
+    # 旧版格式没有 widgets_values_named，退回按 inputs 声明顺序读 widgets_values 的位置法。
+    #
+    # 另外按名字取还有个附带好处：control_after_generate 这类「有值但没有同名输入」的
+    # 前端专用 widget 不会再造成错位（位置法实测会把 "fixed" 塞进布尔输入 continue_audio_latent）。
+    $uiOnlyNames = @('upload', 'audioUI', 'preview', 'control_after_generate', '__lm_autocomplete_meta_text')
     foreach ($node in @($UiWorkflow.nodes)) {
         $inputs = [ordered]@{}
-        $widgetIndex = 0
         foreach ($input in @($node.inputs)) {
-            $hasWidget = $null -ne $input.widget
-            $widgetValue = if ($hasWidget -and $null -ne $node.widgets_values -and $widgetIndex -lt @($node.widgets_values).Count) { @($node.widgets_values)[$widgetIndex] } else { $null }
-            if ($hasWidget) { $widgetIndex++ }
-            # 这些字段只用于 ComfyUI 画布上传控件，不是 API 工作流输入。
-            $isUiOnly = [string]$input.name -in @('upload', 'audioUI')
-            if ($isUiOnly) { continue }
-            if ($null -ne $input.link) {
-                $link = $linkMap[[string]$input.link]
-                if ($link) { $inputs[[string]$input.name] = @($link.node, $link.slot) }
-            } elseif ($hasWidget) {
-                $inputs[[string]$input.name] = $widgetValue
+            if ($null -eq $input.link) { continue }
+            $link = $linkMap[[string]$input.link]
+            if ($link) { $inputs[[string]$input.name] = @($link.node, $link.slot) }
+        }
+        $named = $node.widgets_values_named
+        if ($null -ne $named) {
+            foreach ($property in $named.PSObject.Properties) {
+                $name = [string]$property.Name
+                if ($uiOnlyNames -contains $name) { continue }
+                # 已被连线覆盖的输入以连线为准，不再写 widget 值。
+                if ($inputs.Contains($name)) { continue }
+                $inputs[$name] = $property.Value
+            }
+        } elseif ($null -ne $node.widgets_values) {
+            $widgetIndex = 0
+            $values = @($node.widgets_values)
+            foreach ($input in @($node.inputs)) {
+                if ($null -eq $input.widget) { continue }
+                $name = [string]$input.name
+                if ($widgetIndex -lt $values.Count -and $uiOnlyNames -notcontains $name -and -not $inputs.Contains($name)) {
+                    $inputs[$name] = $values[$widgetIndex]
+                }
+                $widgetIndex++
             }
         }
         $api[[string]$node.id] = [pscustomobject]@{
@@ -800,6 +838,18 @@ function Get-ComfyCapabilities {
         LoraManager  = $nodeSet.Contains('Lora Loader (LoraManager)')
         TEspeed      = $nodeSet.Contains('TESpeedMiniMaxH3')
         VhsLoadVideo = $nodeSet.Contains('VHS_LoadVideo')
+        # RTX 放大前插「透传式清显存」节点用（ComfyUI-Easy-Use 的 easy cleanGpuUsed）。
+        # 缺失时只是没法在放大前腾显存，放大本身照常尝试，不当作错误。
+        ClearVramNode = $nodeSet.Contains('easy cleanGpuUsed')
+        # 「长视频导演台」专属：TimelineDirector 节点包提供的两个必需节点，
+        # 缺失时该模式整体不可用（提示装包，而不是降级出一个跑不通的工作流）。
+        MiniMaxH3TimelinePlanner      = $nodeSet.Contains('MiniMaxH3TimelinePlanner')
+        MiniMaxH3FiniteSegmentSampler = $nodeSet.Contains('MiniMaxH3FiniteSegmentSampler')
+        # 导演台链路里的「可选」节点：缺失时从模型链/SIGMAS 链上摘除并重连，不影响出片。
+        H3SigmaRefiner          = $nodeSet.Contains('H3SigmaRefiner')
+        SageAttentionKJ         = $nodeSet.Contains('PathchSageAttentionKJ')
+        MiniMaxLowVRAMAttention = $nodeSet.Contains('MiniMaxLowVRAMAttention')
+        MiniMaxChunkFeedForward = $nodeSet.Contains('MiniMaxChunkFeedForward')
         # 关键节点：缺失时对应模式直接不可用，需要给出明确提示
         SaveVideo                 = $nodeSet.Contains('SaveVideo')
         MiniMaxH3ImageToVideo     = $nodeSet.Contains('MiniMaxH3ImageToVideo')
@@ -810,6 +860,551 @@ function Get-ComfyCapabilities {
     }
     $script:CapabilityCache[$ComfyUrl] = [pscustomobject]@{ At = $now; Data = $data }
     return $data
+}
+
+# ---------------------------------------------------------------------------
+# 环境自检（只读）
+#
+# 目的：把已经探测到的节点可用性，翻译成「哪个模式还能用 / 缺什么 / 要装哪个包」，
+# 让用户不必等到点生成、再从报错里倒推。
+#
+# 三条设计约束：
+#   1. **只读诊断，绝不阻断生成**：缺可选节点仍然照旧降级出片，这里只是把事实讲清楚。
+#      任何情况下都不能变成「环境不达标就不给点生成」。
+#   2. **零新增探测**：完全复用 Get-ComfyCapabilities 的结果（它自带 60 秒缓存）。
+#   3. **「连不上 ComfyUI」与「缺节点」必须分开**：否则 ComfyUI 没开时满屏红叉，
+#      用户会以为节点装崩了。
+#
+# 关于「节点 → 节点包」的映射为什么不自动提取：4 个基础模式的工作流是「导出(API)」
+# 格式，不带 properties.cnr_id / aux_id；只有导演台那份 UI 格式工作流带，且只覆盖 6 个包。
+# 所以这里保留一张人工登记表作为唯一事实来源。Url 只在确信时填写 —— 留空表示
+# 「请在 ComfyUI-Manager 里搜索 Package 里的 ID」，宁可不给也不给错地址。
+# ---------------------------------------------------------------------------
+
+$script:SelfCheckNodeInfo = @{
+    # ---- comfy-core：ComfyUI 内置，缺失只能靠升级 ComfyUI，不是装包能解决的 ----
+    'SaveVideo'                 = @{ Node = 'SaveVideo';                 Label = '视频保存节点';     Package = ''; Url = ''; IsCore = $true; Impact = '所有模式都无法保存成片' }
+    'CreateVideo'               = @{ Node = 'CreateVideo';               Label = '视频合成';         Package = ''; Url = ''; IsCore = $true; Impact = '所有模式都无法合成为视频' }
+    'ResolutionSelector'        = @{ Node = 'ResolutionSelector';        Label = '分辨率选择';       Package = ''; Url = ''; IsCore = $true; Impact = '所有模式都无法确定画面尺寸' }
+    'ComfyMathExpression'       = @{ Node = 'ComfyMathExpression';       Label = '帧数换算';         Package = ''; Url = ''; IsCore = $true; Impact = '基础四模式的时长换算不可用' }
+    'MiniMaxH3ImageToVideo'     = @{ Node = 'MiniMaxH3ImageToVideo';     Label = 'H3 图生视频';      Package = ''; Url = ''; IsCore = $true; Impact = '文生 / 图生 / 首尾帧三个模式不可用' }
+    'MiniMaxH3ReferenceToVideo' = @{ Node = 'MiniMaxH3ReferenceToVideo'; Label = 'H3 全能参考';      Package = ''; Url = ''; IsCore = $true; Impact = '全能参考模式不可用' }
+
+    # ---- 第三方节点包 ----
+    'MiniMaxH3TimelinePlanner'      = @{ Node = 'MiniMaxH3TimelinePlanner';      Label = '时间线规划台'; Package = 'ComfyUI-MiniMaxH3-TimelineDirector'; Url = 'https://github.com/Songssx/ComfyUI-MiniMaxH3-TimelineDirector'; IsCore = $false; Impact = '长视频导演台不可用' }
+    'MiniMaxH3FiniteSegmentSampler' = @{ Node = 'MiniMaxH3FiniteSegmentSampler'; Label = '分镜采样器';   Package = 'ComfyUI-MiniMaxH3-TimelineDirector'; Url = 'https://github.com/Songssx/ComfyUI-MiniMaxH3-TimelineDirector'; IsCore = $false; Impact = '长视频导演台不可用' }
+    'H3SigmaRefiner'                = @{ Node = 'H3SigmaRefiner';                Label = '额外精修步';   Package = 'ComfyUI-YCNodes-MiniMax-H3';         Url = 'https://github.com/yichengup/ComfyUI-YCNodes-MiniMax-H3';        IsCore = $false; Impact = '导演台跳过额外精修步（仍会正常出片）' }
+    'SageAttentionKJ'               = @{ Node = 'PathchSageAttentionKJ';          Label = 'SageAttention';Package = 'ComfyUI-KJNodes';                    Url = 'https://github.com/kijai/ComfyUI-KJNodes';                       IsCore = $false; Impact = '导演台跳过 SageAttention（显存占用略高）' }
+    'MiniMaxLowVRAMAttention'       = @{ Node = 'MiniMaxLowVRAMAttention';       Label = '低显存注意力'; Package = 'ComfyUI-KJNodes';                    Url = 'https://github.com/kijai/ComfyUI-KJNodes';                       IsCore = $false; Impact = '导演台跳过低显存注意力优化（显存占用略高）' }
+    'MiniMaxChunkFeedForward'       = @{ Node = 'MiniMaxChunkFeedForward';       Label = '分块前馈';     Package = 'ComfyUI-KJNodes';                    Url = 'https://github.com/kijai/ComfyUI-KJNodes';                       IsCore = $false; Impact = '导演台跳过分块前馈（显存占用略高）' }
+    'TEspeed'                       = @{ Node = 'TESpeedMiniMaxH3';              Label = 'TE-Speed 加速';Package = 'TE-Speed-MiniMaxH3';                 Url = 'https://github.com/tl2012tl/TE-Speed-MiniMaxH3';                 IsCore = $false; Impact = '跳过加速，生成变慢但结果正常' }
+    'LoraManager'                   = @{ Node = 'Lora Loader (LoraManager)';     Label = 'LoRA 加载';    Package = 'ComfyUI-Lora-Manager';               Url = '';                                                              IsCore = $false; Impact = '跳过 LoRA，风格/画质微调不生效' }
+    'RtxUpscale'                    = @{ Node = 'RTXVideoSuperResolution';       Label = 'RTX 视频放大'; Package = '';                                   Url = '';                                                              IsCore = $false; Impact = 'RTX 放大开关会被禁用并自动跳过' }
+    'ClearVramNode'                 = @{ Node = 'easy cleanGpuUsed';             Label = '放大前清显存'; Package = 'ComfyUI-Easy-Use';                   Url = 'https://github.com/yolain/ComfyUI-Easy-Use';                     IsCore = $false; Impact = 'RTX 放大前无法腾显存（放大本身照常尝试）' }
+    'VhsLoadVideo'                  = @{ Node = 'VHS_LoadVideo';                 Label = '视频参考素材'; Package = 'VideoHelperSuite';                   Url = 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite';        IsCore = $false; Impact = '全能参考无法使用「视频」类型的参考素材' }
+}
+
+# 每个模式各自需要哪些节点。Required 缺失 -> 该模式整体不可用；Optional 缺失 -> 只降级。
+$script:SelfCheckModes = @(
+    @{ Mode = 't2v';     Label = '文生视频'
+       Required = @('MiniMaxH3ImageToVideo', 'ResolutionSelector', 'ComfyMathExpression', 'CreateVideo', 'SaveVideo')
+       Optional = @('TEspeed', 'LoraManager', 'RtxUpscale', 'ClearVramNode') }
+    @{ Mode = 'i2v';     Label = '图生视频'
+       Required = @('MiniMaxH3ImageToVideo', 'ResolutionSelector', 'ComfyMathExpression', 'CreateVideo', 'SaveVideo')
+       Optional = @('TEspeed', 'LoraManager', 'RtxUpscale', 'ClearVramNode') }
+    @{ Mode = 'flf2v';   Label = '首尾帧'
+       Required = @('MiniMaxH3ImageToVideo', 'ResolutionSelector', 'ComfyMathExpression', 'CreateVideo', 'SaveVideo')
+       Optional = @('TEspeed', 'LoraManager', 'RtxUpscale', 'ClearVramNode') }
+    @{ Mode = 'ref2va';  Label = '全能参考'
+       Required = @('MiniMaxH3ReferenceToVideo', 'ResolutionSelector', 'ComfyMathExpression', 'CreateVideo', 'SaveVideo')
+       Optional = @('VhsLoadVideo', 'TEspeed', 'LoraManager', 'RtxUpscale', 'ClearVramNode') }
+    @{ Mode = 'director'; Label = '长视频导演台'
+       Required = @('MiniMaxH3TimelinePlanner', 'MiniMaxH3FiniteSegmentSampler', 'ResolutionSelector', 'CreateVideo', 'SaveVideo')
+       Optional = @('H3SigmaRefiner', 'SageAttentionKJ', 'MiniMaxLowVRAMAttention', 'MiniMaxChunkFeedForward', 'TEspeed', 'LoraManager', 'RtxUpscale', 'ClearVramNode') }
+)
+
+function Get-SelfCheckNodeEntry {
+    # 把 capabilities 的字段名翻译成给用户看的一条记录。
+    # 登记表里没有的键不丢，退化成「只有类名」——新加探测项时不会因为漏登记而静默消失。
+    param([string]$Key)
+    $info = $script:SelfCheckNodeInfo[$Key]
+    if (-not $info) {
+        return [pscustomobject]@{
+            key = $Key; node = $Key; label = $Key; package = ''; url = ''; isCore = $false
+            impact = '未登记来源，请在 ComfyUI-Manager 中搜索该节点名'
+        }
+    }
+    return [pscustomobject]@{
+        key     = $Key
+        node    = $info.Node
+        label   = $info.Label
+        package = $info.Package
+        url     = $info.Url
+        isCore  = [bool]$info.IsCore
+        impact  = $info.Impact
+    }
+}
+
+function Get-SelfCheckReport {
+    # 把 capabilities 组装成「按模式分组的缺失清单 + 待安装包汇总」。
+    # 只读：不修改任何状态，也不会因为「有缺失」而影响后续请求。
+    param($Capabilities)
+
+    $modeReports = @()
+    $missingKeys = @()
+    $available = 0
+    $degraded = 0
+    $unavailable = 0
+
+    foreach ($definition in $script:SelfCheckModes) {
+        $requiredMissing = @()
+        foreach ($key in $definition.Required) {
+            if ($Capabilities.$key -eq $false) { $requiredMissing += $key }
+        }
+        $optionalMissing = @()
+        foreach ($key in $definition.Optional) {
+            if ($Capabilities.$key -eq $false) { $optionalMissing += $key }
+        }
+        if ($requiredMissing.Count -gt 0) { $status = 'unavailable'; $unavailable++ }
+        elseif ($optionalMissing.Count -gt 0) { $status = 'degraded'; $degraded++ }
+        else { $status = 'ok'; $available++ }
+
+        $modeReports += [pscustomobject]@{
+            mode            = $definition.Mode
+            label           = $definition.Label
+            status          = $status
+            requiredMissing = @($requiredMissing | ForEach-Object { Get-SelfCheckNodeEntry $_ })
+            optionalMissing = @($optionalMissing | ForEach-Object { Get-SelfCheckNodeEntry $_ })
+        }
+        $missingKeys += $requiredMissing
+        $missingKeys += $optionalMissing
+    }
+
+    # 待安装包汇总：按节点包合并（KJNodes 的三个节点会并成一条）。
+    $entries = @()
+    foreach ($key in ($missingKeys | Select-Object -Unique)) { $entries += Get-SelfCheckNodeEntry $key }
+
+    $packages = @()
+    foreach ($group in @($entries | Where-Object { $_.package } | Group-Object { $_.package })) {
+        $head = $group.Group[0]
+        $packages += [pscustomobject]@{
+            package = $head.package
+            url     = $head.url
+            isCore  = [bool]$head.isCore
+            nodes   = @($group.Group | ForEach-Object { $_.node } | Select-Object -Unique)
+        }
+    }
+    # 内置节点单独成条，前端据此提示「升级 ComfyUI」而不是「装包」。
+    $coreNodes = @($entries | Where-Object { $_.isCore } | ForEach-Object { $_.node } | Select-Object -Unique)
+    if ($coreNodes.Count -gt 0) {
+        $packages += [pscustomobject]@{
+            package = 'comfy-core'
+            url     = ''
+            isCore  = $true
+            nodes   = $coreNodes
+        }
+    }
+
+    return [pscustomobject]@{
+        connected = $true
+        summary   = [pscustomobject]@{
+            modes           = $script:SelfCheckModes.Count
+            available       = $available
+            degraded        = $degraded
+            unavailable     = $unavailable
+            missingPackages = $packages.Count
+        }
+        modes    = @($modeReports)
+        packages = @($packages)
+        # 未登记来源的节点（package 为空且非内置）：单独列出来，让用户知道"还有这些缺，
+        # 但本站不知道它属于哪个包"，而不是假装没这回事。
+        unknownNodes = @($entries | Where-Object { -not $_.package -and -not $_.isCore } | ForEach-Object { $_.node } | Select-Object -Unique)
+    }
+}
+
+function Get-ComfyManagerInfo {
+    # 探测 ComfyUI-Manager 是否可用 —— 它提供「一键安装自定义节点」的接口。
+    #
+    # 用 GET /manager/version 做存在性探针：这是 Manager 最轻量的公开路由，返回纯文本版本号。
+    # （接口清单取自节点包源码 glob/manager_server.py，非推断。）
+    #
+    # 探测失败一律返回 available = false 而不是抛错：**没装 Manager 是完全正常的状态**，
+    # 前端会据此退化成「复制 git clone 命令」让用户手动装，不该因此报错。
+    param([string]$ComfyUrl)
+    try {
+        $remote = Invoke-Comfy 'GET' "$ComfyUrl/manager/version"
+        if (-not $remote.Success) { return [pscustomobject]@{ available = $false; version = '' } }
+        $version = ([Text.Encoding]::UTF8.GetString($remote.Bytes)).Trim()
+        # 防误判：ComfyUI 对未知路径正常返回 404，但万一有反向代理回了个 HTML 页，
+        # 这里按「长度异常 / 含标签」把它挡掉，避免把网页当成版本号。
+        if (-not $version -or $version.Length -gt 64 -or $version.Contains('<')) {
+            return [pscustomobject]@{ available = $false; version = '' }
+        }
+        return [pscustomobject]@{ available = $true; version = $version }
+    } catch {
+        return [pscustomobject]@{ available = $false; version = '' }
+    }
+}
+
+function Get-InstallablePackage {
+    # 从登记表反查某个包名对应的仓库地址。
+    # 这是「一键安装」的安全闸门：**仓库地址只来自这张服务端登记表**，
+    # 前端请求里只允许出现包名，因此这个接口不可能被诱导去安装登记表之外的仓库。
+    # 返回 $null 表示不可安装（包不存在 / 是内置节点 / 未登记地址）。
+    param([string]$PackageName)
+    if ([string]::IsNullOrWhiteSpace($PackageName)) { return $null }
+    $packageName = $PackageName.Trim()
+    # 'comfy-core' 不在登记表的 Package 字段里 —— 它是 Get-SelfCheckReport 汇总时
+    # 给「内置节点」现起的合成包名（内置条目的 Package 字段是空串）。这里显式认这一个名字，
+    # 好让 /api/install-package 能回「请更新 ComfyUI」，而不是含糊的「不在可安装清单里」。
+    if ($packageName -eq 'comfy-core') {
+        return [pscustomobject]@{ package = $packageName; url = ''; isCore = $true }
+    }
+    $matched = $false
+    $isCore = $false
+    $url = ''
+    foreach ($info in $script:SelfCheckNodeInfo.Values) {
+        if (([string]$info.Package) -ne $packageName) { continue }
+        $matched = $true
+        if ($info.IsCore) { $isCore = $true; break }
+        if ($info.Url) { $url = [string]$info.Url; break }
+    }
+    if (-not $matched) { return $null }
+    if ($isCore) { return [pscustomobject]@{ package = $packageName; url = ''; isCore = $true } }
+    if (-not $url) { return [pscustomobject]@{ package = $packageName; url = ''; isCore = $false } }
+    return [pscustomobject]@{ package = $packageName; url = $url; isCore = $false }
+}
+
+# ---------------------------------------------------------------------------
+# 必需输入自动补齐（跨节点包版本的兼容层）
+#
+# 背景（真实踩坑）：
+#   ComfyUI 0.35.x 的 execution.py 里 validate_inputs() 会逐个检查每个 required 输入
+#   是否出现在 prompt 中，缺失就写一条 required_input_missing 并整体拒绝请求（HTTP 400）。
+#   而本工作站的工作流 JSON 是「发布时的快照」，上游节点包一旦升级并新增了必需输入，
+#   快照里就没有这个字段，于是整单生成全部失败。
+#   实例：TE-Speed-MiniMaxH3 从 3.2 升到 3.5 时新增了必需输入
+#         mode = ["standard", "4-step LoRA", "8-step LoRA"]，
+#         模型里没有 mode 就会被 ComfyUI 判为 required_input_missing，三种基础模式与
+#         全能参考模式一起挂掉。
+#
+# 另一侧的关键事实：多余输入是安全的。
+#   execution.py 的 get_input_data() 只遍历节点自己声明过的输入（input_category 非空）才
+#   会塞进调用参数，未声明的键被静默忽略；validate_inputs() 也只报「缺必需输入」，不报
+#   「多了未知输入」。所以按当前定义补出来的字段，对旧版节点同样无害。
+#
+# 因此这里不做版本判断、不硬编码字段名，而是每次提交前向 ComfyUI 询问
+# 「这个节点现在声明了哪些必需输入」，把工作流里缺的按声明默认值补上。
+# 上游以后再改字段，这里是自动跟随的，不需要再改工作流 JSON。
+# ---------------------------------------------------------------------------
+
+function Get-ComfyNodeSchema {
+    # 读取单个节点类型的完整定义：GET /object_info/<节点名>。
+    # 结果按「ComfyUI 地址 + 节点名」缓存（成功 10 分钟 / 失败 30 秒，见 $script:NodeSchemaTtl*）。
+    # 探测失败（节点不存在、ComfyUI 临时抽风）时返回 $null，由调用方按「不补齐」处理——
+    # 兼容层只能帮上忙，绝不能在它自己出问题时阻断生成。
+    param([string]$ComfyUrl, [string]$ClassType)
+    if (-not $ComfyUrl -or [string]::IsNullOrWhiteSpace($ClassType)) { return $null }
+
+    $key = "$ComfyUrl|$ClassType"
+    $cached = $script:NodeSchemaCache[$key]
+    if ($cached -and $cached.At) {
+        # 失败结果用短 TTL：缓存里躺着一个 $null 时，下一次提交必须很快能重试。
+        $ttlSeconds = $script:NodeSchemaTtlMinutes * 60
+        if ($cached.PSObject.Properties['Negative'] -and $cached.Negative) {
+            $ttlSeconds = $script:NodeSchemaNegativeTtlSeconds
+        }
+        if (((Get-Date) - $cached.At).TotalSeconds -lt $ttlSeconds) { return $cached.Data }
+    }
+
+    $data = $null
+    try {
+        # 节点名可能带空格和括号（例如 Lora Loader (LoraManager)），必须转义后再拼进路径。
+        $encoded = [System.Uri]::EscapeDataString($ClassType)
+        $remote = Invoke-Comfy 'GET' "$ComfyUrl/object_info/$encoded"
+        if ($remote.Success) {
+            $text = [Text.Encoding]::UTF8.GetString($remote.Bytes)
+            $parsed = $text | ConvertFrom-Json
+            # 返回体形如 { "节点名": { input = { required = ...; optional = ... }, ... } }。
+            # 用 PSObject.Properties 取值而不是 $parsed.$ClassType，避免节点名里的特殊字符被当成
+            # 属性路径解析。这里只请求了一个节点，不存在「仅大小写不同的重复键」问题。
+            $entry = $parsed.PSObject.Properties[$ClassType]
+            if ($entry) { $data = $entry.Value }
+        }
+    } catch {
+        # 静默降级：兼容层失败不该影响本次生成，最多是少补一个字段。
+        $data = $null
+    }
+    $script:NodeSchemaCache[$key] = [pscustomobject]@{
+        At       = (Get-Date)
+        Data     = $data
+        Negative = ($null -eq $data)
+    }
+    return $data
+}
+
+function Test-LooksLikeFileList {
+    # 判断一组组合框候选是不是「文件列表」（模型/图片/音频/LoRA 的文件名枚举）。
+    # 为什么需要：文件列表型 combobox 的第一项就是某个真实文件名，把它当默认值补进工作流
+    # **不会报错**（它确实是节点声明的候选之一，ComfyUI 的 combo 校验会放行），
+    # 结果就是用户静默地用错了模型/素材——比直接报错更难发现。
+    # 判定口径：
+    #   1) 候选数 > 20 —— ComfyUI 自己在回传超长候选列表时也是这个口径（execution.py 里
+    #      对 len(options) > 20 的列表直接截断描述，认为那是"一大堆扫描出来的路径"）；
+    #   2) 候选里出现路径分隔符或常见素材扩展名 —— 枚举型候选（standard/auto/high）不会长这样。
+    param($Candidates)
+    $list = @($Candidates)
+    if ($list.Count -gt 20) { return $true }
+    foreach ($item in $list) {
+        $text = [string]$item
+        if ($text -match '[\\/]') { return $true }
+        if ($text -match '\.(safetensors|ckpt|pt|pth|bin|gguf|onnx|sft|pkl|npz|json|txt|png|jpe?g|webp|gif|bmp|tiff?|mp4|mov|mkv|webm|avi|wav|mp3|flac|ogg|m4a|aac)$') { return $true }
+    }
+    return $false
+}
+
+function Test-RangeAllowsZero {
+    # 数字类型没有声明默认值时，能不能安全地补 0？
+    # ComfyUI 会对 widget 值做区间校验：val < min → value_smaller_than_min、val > max →
+    # value_bigger_than_max，两种情况都直接 400。所以"补 0"在 min=1 这类输入上不是兜底，
+    # 而是把「缺少必需输入」换成一句更难懂的错误。只有区间包含 0（或没声明区间）时才敢补。
+    param($Options, [double]$Value = 0)
+    if (-not $Options) { return $true }
+    $minProperty = $Options.PSObject.Properties['min']
+    if ($minProperty -and $null -ne $minProperty.Value) {
+        try { if ($Value -lt [double]$minProperty.Value) { return $false } } catch { }
+    }
+    $maxProperty = $Options.PSObject.Properties['max']
+    if ($maxProperty -and $null -ne $maxProperty.Value) {
+        try { if ($Value -gt [double]$maxProperty.Value) { return $false } } catch { }
+    }
+    return $true
+}
+
+function Get-ComfyInputDefinition {
+    # 按输入名取定义，required 优先、optional 兜底。
+    # 【为什么两个桶都要看】只查 required 会把「节点把它声明成可选」误判成「节点没有这个输入」，
+    # 于是对着一个其实支持该参数的节点打出「不支持」的结论并丢弃用户的选择——正是兼容层要消灭的静默。
+    # 注意：这里只服务于「探测/读取」；补齐仍然只补 required（见 Complete-RequiredInputs），
+    # 不能因为可选输入有默认值就凭空给工作流加端口。
+    param($Schema, [string]$InputName)
+    if (-not $Schema -or -not $Schema.input -or [string]::IsNullOrWhiteSpace($InputName)) { return $null }
+    foreach ($bucketName in @('required', 'optional')) {
+        $bucket = $Schema.input.$bucketName
+        if (-not $bucket) { continue }
+        $property = $bucket.PSObject.Properties[$InputName]
+        if ($property) { return $property.Value }
+    }
+    return $null
+}
+
+function Get-InputDefaultValue {
+    # 从 /object_info 的单个输入定义里取出可用的默认值。
+    # 定义形态：
+    #   ["FLOAT", { default = 0.08; min = 0; max = 1; step = 0.005 }]
+    #   [["standard", "4-step LoRA"], { default = "standard" }]      ← 组合框
+    #   ["MODEL"]                                                     ← 连线类型，无默认值
+    # 返回 @{ Found = $true/$false; Value = 值; Guessed = $true/$false }。
+    # Guessed 表示「这不是节点声明的默认值，而是工作站按类型/首项取的保守值」——
+    # 调用方要把这类单独告警，让用户知道哪一项其实"是猜的"。见 Complete-RequiredInputs。
+    # 无法确定默认值时返回 Found = $false（典型是 MODEL/LATENT 这类必须连线的输入）——
+    # 那种缺失说明工作流本身有问题，应该让 ComfyUI 正常报错，而不是伪造一个假值。
+    param($Definition)
+    $result = @{ Found = $false; Value = $null; Guessed = $false }
+    if ($null -eq $Definition) { return $result }
+
+    $items = @($Definition)
+    if ($items.Count -ge 1) {
+        $optionsProperty = $null
+        if ($items.Count -ge 2) {
+            try { $optionsProperty = $items[1] } catch { $optionsProperty = $null }
+        }
+
+        # 1) 优先取显式声明的 default（唯一"节点作者亲口说的"值，可信）。
+        if ($optionsProperty) {
+            $defaultProperty = $optionsProperty.PSObject.Properties['default']
+            if ($defaultProperty) {
+                $result.Found = $true
+                $result.Value = $defaultProperty.Value
+                return $result
+            }
+        }
+
+        $typeSpec = $items[0]
+        # 2) 组合框没有 default：只有当候选像「枚举值」时才敢取第一项。
+        if ($null -ne $typeSpec -and -not ($typeSpec -is [string]) -and
+            ($typeSpec -is [System.Array] -or $typeSpec -is [System.Collections.IList])) {
+            $candidates = @($typeSpec)
+            if ($candidates.Count -gt 0 -and -not (Test-LooksLikeFileList $candidates)) {
+                $result.Found = $true
+                $result.Value = $candidates[0]
+                $result.Guessed = $true
+            }
+            return $result
+        }
+
+        # 3) 基本类型没有 default：数字要先确认区间包含 0，否则宁可不补（让 ComfyUI 正常报「缺必需输入」）。
+        switch ([string]$typeSpec) {
+            'INT' {
+                if (Test-RangeAllowsZero $optionsProperty 0) { $result.Found = $true; $result.Value = 0; $result.Guessed = $true }
+            }
+            'FLOAT' {
+                if (Test-RangeAllowsZero $optionsProperty 0.0) { $result.Found = $true; $result.Value = 0.0; $result.Guessed = $true }
+            }
+            'STRING' { $result.Found = $true; $result.Value = ''; $result.Guessed = $true }
+            'BOOLEAN' { $result.Found = $true; $result.Value = $false; $result.Guessed = $true }
+            default { }
+        }
+    }
+    return $result
+}
+
+function Complete-RequiredInputs {
+    # 提交前兜底：对照 ComfyUI 当前实际节点定义，把工作流里缺失的必需输入补成声明默认值。
+    # 这是「节点包升级后工作站还能继续用」的关键一步，原因见本节的块注释。
+    # 只补必需输入，且只在默认值可确定时补；已存在的输入（含所有连线）一律不动。
+    param($Workflow, [string]$ComfyUrl)
+    if (-not $Workflow -or -not $ComfyUrl) { return }
+
+    $filled = @()
+    $guessed = @()
+    foreach ($nodeProperty in @($Workflow.PSObject.Properties)) {
+        $node = $nodeProperty.Value
+        if (-not $node -or -not $node.class_type) { continue }
+
+        $classType = [string]$node.class_type
+        $schema = Get-ComfyNodeSchema $ComfyUrl $classType
+        if (-not $schema) { continue }
+        $required = $schema.input.required
+        if (-not $required) { continue }
+
+        # 工作流里已声明的输入名（连线和普通值都在这里），这些绝不覆盖。
+        $present = @()
+        if ($node.inputs) { $present = @($node.inputs.PSObject.Properties.Name) }
+
+        foreach ($inputProperty in @($required.PSObject.Properties)) {
+            $inputName = $inputProperty.Name
+            if ($present -contains $inputName) { continue }
+
+            $default = Get-InputDefaultValue $inputProperty.Value
+            if (-not $default.Found) { continue }
+
+            Set-InputValue $Workflow $nodeProperty.Name $inputName $default.Value
+            $present += $inputName
+            $entry = '{0}.{1}={2}' -f $classType, $inputName, $default.Value
+            if ($default.Guessed) { $guessed += $entry } else { $filled += $entry }
+        }
+    }
+
+    if ($filled.Count -gt 0 -or $guessed.Count -gt 0) {
+        $parts = @()
+        if ($filled.Count -gt 0) {
+            $parts += ("已按 ComfyUI 当前节点定义自动补齐必需输入：{0}（节点包升级新增的字段，无需修改工作流）。" -f ($filled -join '，'))
+        }
+        if ($guessed.Count -gt 0) {
+            # 这些字段节点没有声明默认值，是工作站按类型/首项取的保守值，必须单独点名：
+            # 用户看到「自动补齐」就不会去核对，而"猜错"的典型后果是静默用错模型或参数。
+            $parts += ("以下输入节点未声明默认值，工作站按其类型取了保守值，请确认是否符合预期：{0}。" -f ($guessed -join '，'))
+        }
+        Add-BuildWarning ($parts -join ' ')
+    }
+}
+
+function Get-ComfyChoiceOptionsInfo {
+    # 与 Get-ComfyChoiceOptions 同源，但额外带一个「探测是否成功」的状态位：Ok / Options。
+    # 【为什么必须要这个状态位】PowerShell 里 `return @()` 和 `return $null` **对调用方是一回事**：
+    # 空数组不会产生任何管道输出，赋值后拿到的都是 $null。所以单靠返回值分不清
+    # 「探测失败，不知道节点支持什么」和「确认节点没有这个输入」——
+    # 而这两种情况的处理刚好相反：前者必须保持安静（免得对着一个其实支持该输入的节点说"接口里没有它"），
+    # 后者必须明确告警（否则用户选的参数会被静默丢弃，正是兼容层要消灭的现象）。
+    # 想用返回值表达三种结果，就得有个明确的载体。
+    param([string]$ComfyUrl, [string]$ClassType, [string]$InputName)
+    $result = [pscustomobject]@{ Ok = $false; Options = @() }
+    $schema = Get-ComfyNodeSchema $ComfyUrl $ClassType
+    if (-not $schema) { return $result }
+
+    $result.Ok = $true
+    # 输入的归属不看 required/optional，两个桶都找（原因见 Get-ComfyInputDefinition）。
+    $definition = Get-ComfyInputDefinition $schema $InputName
+    if ($null -eq $definition) { return $result }
+    $items = @($definition)
+    if ($items.Count -lt 1) { return $result }
+    $typeSpec = $items[0]
+    # 组合框的形态是 [ [候选...], { default = ... } ]：第一个元素是数组，而不是 "FLOAT" 这类字符串。
+    if ($null -eq $typeSpec -or $typeSpec -is [string]) { return $result }
+    if ($typeSpec -is [System.Array] -or $typeSpec -is [System.Collections.IList]) {
+        $result.Options = @($typeSpec)
+    }
+    return $result
+}
+
+function Get-ComfyChoiceOptions {
+    # 只要候选数组的入口（网页下拉、以及不关心探测状态的调用点用这个）。
+    # 需要区分「探测失败」与「确认没有这个输入」时，请用 Get-ComfyChoiceOptionsInfo。
+    # 关联数组约定：这里直接逐个输出元素，调用方一律用 @(...) 收口成数组。
+    # 不要用 PowerShell 那个 `return ,@(...)` 的「防拆包」写法——它会和调用方的 @() 叠成
+    # 「数组套数组」，导致 .Count 恒为 1、-contains 永远不成立（本函数第一版就踩了这个坑，
+    # 结果「节点支持 mode」被判成「不认识 mode」，用户选的模式被静默丢弃）。
+    param([string]$ComfyUrl, [string]$ClassType, [string]$InputName)
+    $info = Get-ComfyChoiceOptionsInfo $ComfyUrl $ClassType $InputName
+    return @($info.Options)
+}
+
+function Clear-ComfyNodeSchemaCache {
+    # 清掉某个 ComfyUI 地址下的节点定义缓存。
+    # 场景：用户刚更新了自定义节点包并重启 ComfyUI，点网页上的「测试连接」（fresh=1）期望立即生效；
+    # 若不清理，Get-ComfyNodeSchema 的 10 分钟缓存会继续返回旧定义——例如 TE-Speed 刚升到 3.5，
+    # 加速模式下拉却还是「不支持选择」，用户会以为新版本没装上。
+    param([string]$ComfyUrl)
+    if (-not $ComfyUrl) { $script:NodeSchemaCache = @{}; return }
+    $prefix = "$ComfyUrl|"
+    # 先复制一份键再删，避免边遍历边修改哈希表。
+    foreach ($key in @($script:NodeSchemaCache.Keys)) {
+        if ($key.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $script:NodeSchemaCache.Remove($key) | Out-Null
+        }
+    }
+}
+
+function Set-TespeedMode {
+    # 把网页上选的 TE-Speed 加速模式写进工作流。
+    #
+    # 兼容性说明（这就是本函数存在的全部理由）：
+    #   mode 是 TE-Speed 3.5 才新增的输入。旧版节点没有这个输入，而 ComfyUI 会静默忽略
+    #   未被节点声明的输入，所以「写进去」本身不会让旧版节点报错；但旧版节点是按实际采样
+    #   步数自行切换内部策略的，用户选的模式并不会生效。因此这里必须先核对节点是否真的
+    #   声明了 mode，不认识就明确提示——不能让用户以为切了模式，实际却被节点悄悄忽略。
+    param($Workflow, [string]$NodeId, $Config, [string]$ComfyUrl)
+    if (-not $Workflow -or -not $Workflow.PSObject.Properties[$NodeId]) { return }
+
+    $mode = ''
+    if ($Config -and $Config.PSObject.Properties['teMode']) { $mode = [string]$Config.teMode }
+    # 网页没选模式（旧版网页、或该项被禁用）时什么都不做，
+    # 交给提交前的 Complete-RequiredInputs 按节点声明的默认值补齐。
+    if ([string]::IsNullOrWhiteSpace($mode)) { return }
+
+    $info = Get-ComfyChoiceOptionsInfo $ComfyUrl 'TESpeedMiniMaxH3' 'mode'
+    if (-not $info.Ok) {
+        # 探测失败（ComfyUI 正在重启 / 读不到节点定义）：既不能写，也不要下结论。
+        # 这里如果按「候选为空」处理，就会对着一个其实支持 mode 的节点打出「节点接口里没有 mode」——
+        # 那是一句事实错误的话，还会把用户引向"去装/升级节点"这种无效操作。
+        # 本次交给提交前的 Complete-RequiredInputs 兜底（它读同一份缓存，结论一致）。
+        return
+    }
+    $supported = @($info.Options)
+    if ($supported.Count -eq 0) {
+        # 节点没有 mode 输入：standard 是它的固有行为，无需提示；选了非 standard 才提示。
+        if ($mode -ne 'standard') {
+            $message = "当前 TE-Speed 节点版本不支持加速模式选择（节点接口里没有 mode），已忽略「{0}」：" -f $mode
+            Add-BuildWarning ($message + '该节点会按采样步数自行切换策略。安装 TE-Speed 3.5 及以上版本后本项才会生效。')
+        }
+        return
+    }
+    if ($supported -notcontains $mode) {
+        Add-BuildWarning ("当前 TE-Speed 节点不认识加速模式「{0}」，本次已忽略；该节点可选：{1}。" -f $mode, ($supported -join ' / '))
+        return
+    }
+    Set-InputValue $Workflow $NodeId 'mode' $mode
 }
 
 function Assert-SelectedModelsExist {
@@ -999,32 +1594,92 @@ function Test-RtxVfxRuntime {
 
 function Add-RtxUpscaleChain {
     # 在输出端接入 RTX 放大链（只做后处理，不碰采样链）：
-    # 源视频 -> GetVideoComponents（拆出图像帧/音频/fps/位深/色彩空间）
-    # -> RTXVideoSuperResolution（只放大图像帧）-> CreateVideo（用原参数与原音频重新合成）。
+    #   [可选：清显存] -> GetVideoComponents（拆出图像帧/音频/fps/位深/色彩空间）
+    #   -> RTXVideoSuperResolution（只放大图像帧）-> CreateVideo（用原参数与原音频重新合成）。
     # 返回新 CreateVideo 的节点 ID，由调用方把保存节点的 video 输入改接到它。
-    param($Workflow, [string]$SourceNodeId, [double]$Scale, [int]$StartId)
+    #
+    # 【为什么要把「清显存」插在放大之前】
+    # RTX 放大是整个图的最后一步。执行到它时采样刚结束，MiniMax H3 的权重和中间张量仍然占着
+    # 显存（ComfyUI 不会在节点之间自动卸载模型）。而 RTX Video Super Resolution 走 NVIDIA NGX，
+    # 需要自己申请一块显存去创建效果实例；显存已经吃紧时这一步很容易失败，
+    # 表现就是"采样跑完了、后处理崩掉"，用户白等几分钟。
+    # 所以先把模型卸掉、把缓存还回去，再让 VSR 申请显存。
+    #
+    # 【实现方式】用 ComfyUI-Easy-Use 的 easy cleanGpuUsed 做「透传式清显存」：
+    #   anything 进、anything 出（INPUT_TYPES 里 required.anything 是 '*' 类型），
+    #   且 OUTPUT_NODE=True。ComfyUI 的 validate_node_input 对 '*' 直接放行
+    #   （comfy_execution/validation.py：received_type 或 input_type 为 '*' 即返回 True），
+    #   所以它的输出可以直接接进 GetVideoComponents 的 VIDEO 输入，
+    #   靠依赖关系强制出「先清显存、再放大」的顺序。
+    #   它内部只做 gc.collect() + unload_all_models() + soft_empty_cache()，
+    #   以及清 ComfyUI-Easy-Use 自己那张 tagged cache，不会破坏 ComfyUI 的执行缓存，
+    #   因此接在图中段是安全的。
+    #
+    # 【和 v20260912 移除的「末尾清显存」不冲突】那次的移除原因是：清理节点接在整张图末尾，
+    # 会在任务刚结束、队列里下一个任务刚要加载模型的瞬间执行，两边抢时序导致下一个任务读页缓存失败。
+    # 这里插在图中段，本任务还在跑、队列里的下一个任务还没轮到，不存在这个问题。
+    param($Workflow, [string]$SourceNodeId, [double]$Scale, [int]$StartId, [bool]$ClearVramBefore = $false)
+
+    $need = 3
+    if ($ClearVramBefore) { $need = 4 }
     $ids = @()
     $candidate = $StartId
-    while ($ids.Count -lt 3) {
+    while ($ids.Count -lt $need) {
         $name = [string]$candidate
         if (-not $Workflow.PSObject.Properties[$name]) { $ids += $name }
         $candidate++
     }
-    Add-WorkflowNode $Workflow $ids[0] 'GetVideoComponents' ([ordered]@{ video = @($SourceNodeId, 0) }) | Out-Null
-    Add-WorkflowNode $Workflow $ids[1] 'RTXVideoSuperResolution' ([ordered]@{
+
+    # 逐段往下接：每插入一级就把来源换成上一级的输出，保证执行顺序严格递增。
+    $videoSource = @($SourceNodeId, 0)
+    $index = 0
+    if ($ClearVramBefore) {
+        Add-WorkflowNode $Workflow $ids[0] 'easy cleanGpuUsed' ([ordered]@{ anything = $videoSource }) | Out-Null
+        $videoSource = @($ids[0], 0)
+        $index = 1
+    }
+    Add-WorkflowNode $Workflow $ids[$index] 'GetVideoComponents' ([ordered]@{ video = $videoSource }) | Out-Null
+    Add-WorkflowNode $Workflow $ids[$index + 1] 'RTXVideoSuperResolution' ([ordered]@{
         resize_type = 'scale by multiplier'
         'resize_type.scale' = $Scale
         quality = 'ULTRA'
-        images = @($ids[0], 0)
+        images = @($ids[$index], 0)
     }) | Out-Null
-    Add-WorkflowNode $Workflow $ids[2] 'CreateVideo' ([ordered]@{
-        fps = @($ids[0], 2)
-        bit_depth = @($ids[0], 3)
-        color_space = @($ids[0], 4)
-        images = @($ids[1], 0)
-        audio = @($ids[0], 1)
+    Add-WorkflowNode $Workflow $ids[$index + 2] 'CreateVideo' ([ordered]@{
+        fps = @($ids[$index], 2)
+        bit_depth = @($ids[$index], 3)
+        color_space = @($ids[$index], 4)
+        images = @($ids[$index + 1], 0)
+        audio = @($ids[$index], 1)
     }) | Out-Null
-    return $ids[2]
+    return $ids[$index + 2]
+}
+
+function Add-RtxUpscaleLink {
+    # RTX 放大的统一接入点：基础三模式与全能参考共用，避免两处逻辑各写一遍后漂移。
+    # 返回「最终视频连线」(@(节点ID, 输出槽))；未开启放大或节点缺失时原样返回来源连线。
+    param($Workflow, [string]$SourceNodeId, [int]$StartId, $Config, $Capabilities)
+
+    $link = @($SourceNodeId, 0)
+    if (-not $Config.rtxUpscale) { return $link }
+
+    # RTX 放大是可选的画质增强：没装节点包时跳过放大继续出片，而不是阻断整个生成。
+    if (-not $Capabilities.RtxUpscale) {
+        Add-BuildWarning '未检测到 RTXVideoSuperResolution 节点（NVIDIA RTX Video 节点包），本次已跳过 RTX 放大，视频按原分辨率输出。安装节点包并重启 ComfyUI 后会自动恢复。'
+        return $link
+    }
+
+    # 放大前先清显存（见 Add-RtxUpscaleChain 的详细说明）。
+    # 清显存节点是 ComfyUI-Easy-Use 提供的可选节点：缺失时不让放大失败，但要明确告诉用户
+    # 「这次没能在放大前腾显存」——放大真失败时，这就是最可能的原因。
+    $clearBefore = [bool]$Capabilities.ClearVramNode
+    if (-not $clearBefore) {
+        Add-BuildWarning '未检测到 ComfyUI-Easy-Use（easy cleanGpuUsed），本次无法在 RTX 放大前预先清理显存。若放大失败，请安装该节点包后重试；也可以把放大倍数降到 1-2 倍减少显存压力。'
+    }
+
+    $scale = Get-RtxScaleValue $Config.rtxUpscaleScale
+    $videoOut = Add-RtxUpscaleChain $Workflow $SourceNodeId $scale $StartId -ClearVramBefore:$clearBefore
+    return @($videoOut, 0)
 }
 
 function Build-ReferenceWorkflow {
@@ -1096,6 +1751,9 @@ function Build-ReferenceWorkflow {
     }
     if ($capabilities.TEspeed) {
         Set-InputValue $Workflow $speedNode 'model' $modelLink
+        # 加速模式（standard / 4-step LoRA / 8-step LoRA）只在节点确实被保留时才注入，
+        # 否则节点马上会被移除，再提示模式不生效就是误导。节点版本不支持时会给出明确提示。
+        Set-TespeedMode $Workflow $speedNode $Config $ComfyUrl
     } else {
         # 没有 TE-Speed 时把模型直接接到采样器的 guider（节点 126），跳过加速而不是报错。
         Add-BuildWarning '未检测到 TE-SpeedMiniMaxH3 加速节点，本次已跳过加速（生成会变慢，结果正常）。安装该节点包并重启 ComfyUI 后会自动恢复。'
@@ -1188,21 +1846,363 @@ function Build-ReferenceWorkflow {
     # 调用 ComfyUI 官方 /free 接口，让清理时机与排队执行彻底解耦。
     # 保存节点(172)固定接在 CreateVideo(130) 上；RTX 放大插在两者之间。
     $saveSource = '130'
-    $finalVideoLink = @('130', 0)
-    $rtxScale = Get-RtxScaleValue $Config.rtxUpscaleScale
-    if ($Config.rtxUpscale) {
-        # RTX 放大是可选的画质增强：没装节点包时跳过放大继续出片。
-        if (-not $capabilities.RtxUpscale) {
-            Add-BuildWarning '未检测到 RTXVideoSuperResolution 节点（NVIDIA RTX Video 节点包），本次已跳过 RTX 放大，视频按原分辨率输出。安装节点包并重启 ComfyUI 后会自动恢复。'
-        } else {
-            $videoOut = Add-RtxUpscaleChain $Workflow $saveSource $rtxScale $nextId
-            $finalVideoLink = @($videoOut, 0)
-        }
-    }
+    # 统一走 Add-RtxUpscaleLink：未开启 RTX 时原样返回 CreateVideo 的连线。
+    $finalVideoLink = Add-RtxUpscaleLink $Workflow $saveSource $nextId $Config $capabilities
 
     # 输出节点统一用 ComfyUI 官方内置的 SaveVideo（工作流 JSON 里节点 172 已经是 SaveVideo），
     # 全能参考因此不再依赖第三方的 ComfyUI-MetadataCleaner。
     Set-InputValue $Workflow '172' 'video' $finalVideoLink
+
+    return $Workflow
+}
+
+function Get-H3FrameCount {
+    # 秒数 -> MiniMax H3 合法帧数（必须落在 5 + 17n 上）。
+    # 与 $script:FrameExpression 是同一套公式，这里先算成整数，供导演台划分各分镜的帧范围。
+    param([double]$Seconds)
+    $steps = [Math]::Round(($Seconds * 24 - 5) / 17)
+    if ($steps -lt 0) { $steps = 0 }
+    return [int](5 + $steps * 17)
+}
+
+function Get-H3Overlap {
+    # 相邻分镜之间的重叠帧数，复刻节点包 js/segment_windows.mjs 的 nearestOverlap。
+    #
+    # 候选集 = [0, 1] 再加上所有 5+17n（H3 的合法帧数梯度），筛掉超过上限的，
+    # 最后挑出最接近目标值（默认 39）的那个。所以：
+    #   * 段足够长时结果就是 39；
+    #   * 段很短、上限不足 39 时会退到 22 / 5 / 1 / 0。
+    # 比较用严格小于、初值取 0，与官方 reduce 的行为一致（等距时保留先出现的）。
+    param([int]$Maximum, [int]$Target = 39)
+    $candidates = New-Object System.Collections.Generic.List[int]
+    $candidates.Add(0)
+    $candidates.Add(1)
+    $steps = [Math]::Max(0, [Math]::Floor(($Maximum - 5) / 17) + 1)
+    for ($i = 0; $i -lt $steps; $i++) { $candidates.Add(5 + 17 * $i) }
+    $best = 0
+    foreach ($candidate in $candidates) {
+        if ($candidate -gt $Maximum) { continue }
+        if ([Math]::Abs($candidate - $Target) -lt [Math]::Abs($best - $Target)) { $best = $candidate }
+    }
+    return $best
+}
+
+function Build-DirectorWorkflow {
+    # 「长视频导演台」（ComfyUI-MiniMaxH3-TimelineDirector · Songssx）构建。
+    #
+    # 它与其余四个模式最大的不同：提示词 / 参考图 / 分镜划分 / 二采超分设置
+    # 全部塞在节点 7（MiniMaxH3TimelinePlanner）的 timeline_data 这一条 JSON 字符串里，
+    # 而不是挂在普通节点的输入上。所以这里的主要工作是把网页表单重新组装成 timeline_data。
+    #
+    # 分镜帧范围的约定：每段各自取 5+17n 帧（单段生成必须满足这个约束），
+    # 段与段之间按「绝对帧号」累加 —— 第 2 段从第 1 段的 endFrame 接着往下排。
+    # 单段时结果与画布上手工导出的工作流完全一致（15 秒 -> 362 帧 -> 15.0833 秒）。
+    param($Config, $Workflow, [string]$ComfyUrl, $Capabilities)
+
+    # ---- 分段与提示词 ----
+    # 语义照抄素材规划台（它的 globalPromptHint / globalPromptInactive 两条文案）：
+    #   * 每一段提示词都为空  -> 「全局提示词」生效，并复用到每一段；
+    #   * 只要有任何一段填了 -> 全局提示词不生效，且要求每一段都补齐。
+    $globalPrompt = [string]$Config.directorGlobalPrompt
+    $segments = @()
+    foreach ($item in @($Config.directorSegments)) {
+        if (-not $item) { continue }
+        $text = if ($item.PSObject.Properties['prompt']) { [string]$item.prompt } else { '' }
+        $seconds = 5
+        if ($item.PSObject.Properties['duration']) { $seconds = [int]$item.duration }
+        # 该段引用哪些素材（按文件名）。这里必须区分两种"空"：
+        #   null（字段为 null） = 未指定 -> 引用全部（"全选"时前端存的就是 null）
+        #   数组（含空数组）    = 显式指定 -> 空数组表示这一段不引用任何同类素材，
+        #                         素材规划台本身是允许的（官方用例里有 images:[] 只挂音频的段）。
+        # 注意别用 @() 兜底把两者抹平：PowerShell 5.1 能区分（null 判为 $null，空数组是长度 0 的
+        # Object[]），但比较时**必须把 $null 写在左边**，否则 -ne 会退化成「数组过滤」而不是标量比较。
+        $imageNamesProperty = $item.PSObject.Properties['imageNames']
+        $hasImageFilter = $false
+        $imageNames = @()
+        if ($imageNamesProperty -and ($null -ne $imageNamesProperty.Value)) {
+            $hasImageFilter = $true
+            $imageNames = @($imageNamesProperty.Value)
+        }
+        $audioNamesProperty = $item.PSObject.Properties['audioNames']
+        $hasAudioFilter = $false
+        $audioNames = @()
+        if ($audioNamesProperty -and ($null -ne $audioNamesProperty.Value)) {
+            $hasAudioFilter = $true
+            $audioNames = @($audioNamesProperty.Value)
+        }
+        $segments += [pscustomobject]@{
+            Prompt         = $text
+            Duration       = [Math]::Max(1, [Math]::Min(15, $seconds))
+            ImageNames     = $imageNames
+            HasImageFilter = $hasImageFilter
+            AudioNames     = $audioNames
+            HasAudioFilter = $hasAudioFilter
+        }
+    }
+    if ($segments.Count -eq 0) { throw '长视频导演台至少需要 1 个分段。' }
+
+    $useGlobalPrompt = $true
+    foreach ($segment in $segments) {
+        if (-not [string]::IsNullOrWhiteSpace($segment.Prompt)) { $useGlobalPrompt = $false; break }
+    }
+    if ($useGlobalPrompt) {
+        if ([string]::IsNullOrWhiteSpace($globalPrompt)) { throw '请填写「全局提示词」，或给每一段分别填写提示词。' }
+        foreach ($segment in $segments) { $segment.Prompt = $globalPrompt }
+    } else {
+        for ($index = 0; $index -lt $segments.Count; $index++) {
+            if ([string]::IsNullOrWhiteSpace($segments[$index].Prompt)) {
+                throw ("第 {0} 段还没填提示词：要么把每段都补全，要么把所有分段的提示词清空、改用全局提示词。" -f ($index + 1))
+            }
+        }
+    }
+
+    # ---- 参考图：网页已上传到 minimax_h3_timeline_director/ 子目录，这里登记成 images[] ----
+    $imageObjects = @()
+    $imageIds = @()
+    $imageIndex = 0
+    foreach ($item in @($Config.directorImages)) {
+        if (-not $item) { continue }
+        $file = if ($item.PSObject.Properties['file']) { [string]$item.file } else { '' }
+        $file = $file.Replace('\', '/').TrimStart('/')
+        if ([string]::IsNullOrWhiteSpace($file)) { continue }
+        $imageIndex++
+        $id = 'ref{0}' -f $imageIndex
+        $imageIds += $id
+        $width = 0
+        $height = 0
+        if ($item.PSObject.Properties['width']) { $width = [int]$item.width }
+        if ($item.PSObject.Properties['height']) { $height = [int]$item.height }
+        $imageObjects += [pscustomobject]@{
+            id     = $id
+            file   = $file
+            name   = [System.IO.Path]::GetFileName($file)
+            width  = $width
+            height = $height
+        }
+    }
+
+    # ---- 参考视频 / 音频：登记进 videoClips[] 与 audios[]，再由分镜按 id 引用 ----
+    # 字段结构取自节点包源码（Songssx/ComfyUI-MiniMaxH3-TimelineDirector）：
+    #   * js/minimax_h3_timeline_director.js 导入视频时构造的对象是
+    #     {id,file,name,start,duration,trimStart,sourceDuration,hasAudio,referenceMode,peaks,proxy}；
+    #   * 同一文件加载音频时会补上 id 与 audioMode（"reference" | "locked"），且只要求存在 file；
+    #   * segments[].images / segments[].audios 都是「id 字符串数组」，videoClips 则是全局的。
+    $videoObjects = @()
+    $videoIds = @()
+    $videoIndex = 0
+    foreach ($item in @($Config.directorVideos)) {
+        if (-not $item) { continue }
+        $file = if ($item.PSObject.Properties['file']) { [string]$item.file } else { '' }
+        $file = $file.Replace('\', '/').TrimStart('/')
+        if ([string]::IsNullOrWhiteSpace($file)) { continue }
+        $videoIndex++
+        $id = 'clip{0}' -f $videoIndex
+        $videoIds += $id
+        $seconds = 0.0
+        if ($item.PSObject.Properties['duration']) { $seconds = [double]$item.duration }
+        # 【必须保证 duration > 0 且 hasAudio 不为 false】
+        # 节点侧 minimax_h3_finite_segments.py 对 videoClips 有两道硬过滤：
+        #     clip.get("file") and clip.get("hasAudio", True) is not False
+        #     and float(clip.get("duration") or 0.0) > 0.0
+        # 即：hasAudio=false 的视频、以及时长读不出来（0 或缺失）的视频都会被【静默丢弃】——
+        # 界面上传了却完全不参与生成，而且没有任何报错。所以这里宁可兜底也不能留 0。
+        # 兜底 5 秒与节点侧 JS 归一化的 num(c.duration, 5) 默认值一致。
+        if ($seconds -le 0) { $seconds = 5 }
+        $videoObjects += [pscustomobject]@{
+            id             = $id
+            file           = $file
+            name           = [System.IO.Path]::GetFileName($file)
+            start          = 0
+            duration       = $seconds
+            trimStart      = 0
+            sourceDuration = $seconds
+            # 官方网页的归一化是 c.hasAudio !== false（默认 true），这里必须跟随默认值：
+            # 给 false 会让整条参考视频被过滤掉。
+            hasAudio       = $true
+            referenceMode  = 'guide'
+            peaks          = @()
+            proxy          = ''
+        }
+    }
+
+    $audioObjects = @()
+    $audioIds = @()
+    $audioIndex = 0
+    foreach ($item in @($Config.directorAudios)) {
+        if (-not $item) { continue }
+        $file = if ($item.PSObject.Properties['file']) { [string]$item.file } else { '' }
+        $file = $file.Replace('\', '/').TrimStart('/')
+        if ([string]::IsNullOrWhiteSpace($file)) { continue }
+        $audioIndex++
+        $id = 'audio{0}' -f $audioIndex
+        $audioIds += $id
+        $seconds = 0.0
+        if ($item.PSObject.Properties['duration']) { $seconds = [double]$item.duration }
+        $audioObjects += [pscustomobject]@{
+            id        = $id
+            file      = $file
+            name      = [System.IO.Path]::GetFileName($file)
+            duration  = $seconds
+            audioMode = 'reference'
+        }
+    }
+
+    # ---- 帧范围：与节点包 js/segment_windows.mjs 的 createWindows 保持同一几何 ----
+    # 每段各自取 5+17n 帧；**相邻两段默认重叠 39 帧**，首段仍从 0 开始。
+    #
+    # 为什么是 39：官方 createWindows 里 overlap 的默认值就是这个字面量，并且会用
+    # nearestOverlap 把它吸附到 [0, 1, 5, 22, 39, 56, ...] 中「不超过
+    # min(本段帧数, 上段帧数) - 1」的最接近值 —— 段很短时重叠会随之变小。
+    # 三处佐证（均取自节点包源码，非推断）：
+    #   * 官方单测 tests/segment_windows.test.mjs：createWindows([],4,243) 的
+    #     startFrame = [0, 204, 408, 612]，步长 204 = 243 - 39；
+    #   * 官方示例工作流 example_workflows/…导演台工作流.json 里两段是 {0,192}
+    #     与 {153,396}，192 - 153 = 39；
+    #   * editWindow() 的注释明确要求 "preserve existing seam overlaps"。
+    # 这段重叠是跨段承接用的。早先按「无缝累加」实现（上一段 endFrame 直接当下一段
+    # 起点），会让成片比官方长、且段边界缺少承接区间，故改回官方几何。
+    $segmentLengths = @()
+    foreach ($segment in $segments) { $segmentLengths += (Get-H3FrameCount $segment.Duration) }
+
+    $segmentObjects = @()
+    $lastFrame = 0
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        $segment = $segments[$index]
+        $frames = $segmentLengths[$index]
+        if ($index -eq 0) {
+            $startFrame = 0
+        } else {
+            # 重叠上限 = min(本段, 上段) - 1；理论上限为负时按 0 处理（不重叠且不可后移）。
+            $overlapLimit = [Math]::Min($frames, $segmentLengths[$index - 1]) - 1
+            $overlap = if ($overlapLimit -ge 0) { Get-H3Overlap $overlapLimit } else { 0 }
+            $startFrame = $lastFrame - $overlap
+        }
+        # 本段引用的素材：没指定过（null）就引用全部；指定过（哪怕是空数组）就按名单挑，
+        # 空名单即"这一段不引用任何同类素材"。
+        $segmentImageIds = @()
+        foreach ($image in $imageObjects) {
+            if (-not $segment.HasImageFilter) { $segmentImageIds += $image.id; continue }
+            if ($segment.ImageNames -contains $image.name) { $segmentImageIds += $image.id }
+        }
+        $segmentAudioIds = @()
+        foreach ($audio in $audioObjects) {
+            if (-not $segment.HasAudioFilter) { $segmentAudioIds += $audio.id; continue }
+            if ($segment.AudioNames -contains $audio.name) { $segmentAudioIds += $audio.id }
+        }
+        $segmentObjects += [pscustomobject]@{
+            images     = @($segmentImageIds)
+            audios     = @($segmentAudioIds)
+            prompt     = $segment.Prompt
+            startFrame = $startFrame
+            endFrame   = $startFrame + $frames
+        }
+        $lastFrame = $startFrame + $frames
+    }
+    # 成片总长 = 最后一段的结束帧（段间重叠已经体现为总长的减少）。
+    $totalSeconds = [Math]::Round($lastFrame / 24.0, 6)
+
+    # ---- 二采超分（secondPass） ----
+    $secondPass = $true
+    if ($null -ne $Config.directorSecondPass) { $secondPass = [bool]$Config.directorSecondPass }
+    $secondPassModel = [string]$Config.directorSecondPassModel
+    if ([string]::IsNullOrWhiteSpace($secondPassModel)) { $secondPassModel = 'minimax_h3_latent_upscaler_3d_bf16.safetensors' }
+    $highSteps = 2
+    if ($null -ne $Config.directorSecondPassSteps) { $highSteps = [int]$Config.directorSecondPassSteps }
+    $highSteps = [Math]::Max(1, [Math]::Min(10, $highSteps))
+
+    $timeline = [ordered]@{
+        version             = 9
+        fps                 = 24
+        globalPrompt        = $globalPrompt
+        secondPass          = $secondPass
+        secondPassModel     = $secondPassModel
+        secondPassHighSteps = $highSteps
+        selection           = [ordered]@{ start = 0; duration = $totalSeconds }
+        videoAudioEnabled   = $true
+        videoClips          = @($videoObjects)
+        images              = @($imageObjects)
+        audios              = @($audioObjects)
+        segmentConfig       = [ordered]@{
+            count       = $segmentObjects.Count
+            activeIndex = 0
+            mode        = 'timeline'
+            segments    = @($segmentObjects)
+        }
+    }
+    Set-InputValue $Workflow '7' 'timeline_data' ($timeline | ConvertTo-Json -Depth 20 -Compress)
+    Set-InputValue $Workflow '7' 'generation_seconds' $totalSeconds
+
+    # ---- 常规参数 ----
+    Set-InputValue $Workflow '18' 'aspect_ratio' (Normalize-AspectRatio ([string]$Config.aspectRatio))
+    Set-InputValue $Workflow '18' 'megapixels' (Get-SafeMegapixels $Config.megapixels)
+    Set-InputValue $Workflow '1' 'unet_name' ([string]$Config.unet)
+    Set-InputValue $Workflow '2' 'clip_name' ([string]$Config.clip)
+    Set-InputValue $Workflow '3' 'vae_name' ([string]$Config.videoVae)
+    Set-InputValue $Workflow '4' 'vae_name' ([string]$Config.audioVae)
+    Set-InputValue $Workflow '5' 'steps' ([int]$Config.steps)
+    Set-InputValue $Workflow '6' 'sampler_name' ([string]$Config.samplerName)
+    Set-InputValue $Workflow '8' 'seed' (Get-SafeSeed $Config.seed)
+
+    # ---- 模型链逐级降级：1 → 20 → 32 → 33 → 23 → 17 → (5, 8) ----
+    # 缺哪个可选节点就把它从链上摘掉，用前一个节点的 MODEL 直接接给下一个，不影响出片。
+    $modelChain = @(
+        [pscustomobject]@{ Id = '20'; Ok = [bool]$Capabilities.LoraManager;             Label = 'ComfyUI-LoraManager' }
+        [pscustomobject]@{ Id = '32'; Ok = [bool]$Capabilities.MiniMaxLowVRAMAttention; Label = 'ComfyUI-KJNodes（MiniMaxLowVRAMAttention）' }
+        [pscustomobject]@{ Id = '33'; Ok = [bool]$Capabilities.MiniMaxChunkFeedForward; Label = 'ComfyUI-KJNodes（MiniMaxChunkFeedForward）' }
+        [pscustomobject]@{ Id = '23'; Ok = [bool]$Capabilities.TEspeed;                 Label = 'TE-SpeedMiniMaxH3' }
+        [pscustomobject]@{ Id = '17'; Ok = [bool]$Capabilities.SageAttentionKJ;         Label = 'ComfyUI-KJNodes（PathchSageAttentionKJ）' }
+    )
+    $source = @('1', 0)
+    $dropped = @()
+    foreach ($link in $modelChain) {
+        if (-not $link.Ok) {
+            $dropped += $link.Label
+            Remove-WorkflowNode $Workflow $link.Id
+            continue
+        }
+        Set-InputValue $Workflow $link.Id 'model' $source
+        $source = @($link.Id, 0)
+    }
+    Set-InputValue $Workflow '5' 'model' $source
+    Set-InputValue $Workflow '8' 'model' $source
+
+    # CLIP：LoraManager 在链上时用它输出的 CLIP（LoRA 同样作用于文本编码器），摘掉后直连 CLIPLoader。
+    if ($Capabilities.LoraManager) { Set-InputValue $Workflow '8' 'clip' @('20', 1) }
+    else { Set-InputValue $Workflow '8' 'clip' @('2', 0) }
+
+    if ($dropped.Count -gt 0) {
+        Add-BuildWarning ('导演台链路缺少可选节点，本次已跳过：{0}。安装对应节点包并重启 ComfyUI 后自动恢复，结果仍会正常产出。' -f (($dropped | Select-Object -Unique) -join '、'))
+    }
+
+    # LoRA 写入（节点缺失时上面已摘除，这里只在存在时写）
+    if ($Capabilities.LoraManager) { [void](Set-LoraManagerInputs $Workflow '20' $Config.loras) }
+
+    # TE-Speed 参数与加速模式
+    if ($Capabilities.TEspeed) {
+        Set-InputValue $Workflow '23' 'processing_control_value' ([double]$Config.teControl)
+        Set-InputValue $Workflow '23' 'processing_percent_1' ([double]$Config.tePercent1)
+        Set-InputValue $Workflow '23' 'processing_percent_2' ([double]$Config.tePercent2)
+        Set-TespeedMode $Workflow '23' $Config $ComfyUrl
+    }
+
+    # SIGMAS 链：5 → 30 → 8；缺 H3SigmaRefiner 时把 5 的 SIGMAS 直连 8
+    if ($Capabilities.H3SigmaRefiner) {
+        Set-InputValue $Workflow '8' 'sigmas' @('30', 0)
+    } else {
+        Remove-WorkflowNode $Workflow '30'
+        Set-InputValue $Workflow '8' 'sigmas' @('5', 0)
+        Add-BuildWarning '未检测到 H3SigmaRefiner（ComfyUI-YCNodes-MiniMax-H3），本次已跳过额外精修步（结果仍会正常产出）。'
+    }
+
+    # RTX 放大：导演台的输出链是 CreateVideo(9) → SaveVideo(10)，与基础三模式/全能参考同构，
+    # 直接复用同一个统一接入点把它插在两者之间；未开启放大（或没装节点包）时原样返回
+    # CreateVideo 的连线，走的是和以前完全一样的直连路径。
+    $nextId = 1000
+    foreach ($property in $Workflow.PSObject.Properties) {
+        try { $nextId = [Math]::Max($nextId, [int]$property.Name + 1) } catch {}
+    }
+    $finalVideoLink = Add-RtxUpscaleLink $Workflow '9' $nextId $Config $Capabilities
+    Set-InputValue $Workflow '10' 'video' $finalVideoLink
 
     return $Workflow
 }
@@ -1216,16 +2216,27 @@ function Build-Workflow {
     Set-CapabilityCache $ComfyUrl $capabilities
     # 关键节点缺失时给出明确原因（这些由较新版本 ComfyUI 内置，无法自动降级）。
     $missingCore = @()
-    if ([string]$Config.mode -eq 'ref2va') {
+    $missingDirector = @()
+    if ([string]$Config.mode -eq 'director') {
+        # 导演台不用内置的 MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo 出片，
+        # 而是由 ComfyUI-MiniMaxH3-TimelineDirector（Songssx）的两个节点承担，
+        # 所以这两项单独检查、单独提示（缺的是节点包，不是 ComfyUI 版本）。
+        if (-not $capabilities.MiniMaxH3TimelinePlanner) { $missingDirector += 'MiniMaxH3TimelinePlanner' }
+        if (-not $capabilities.MiniMaxH3FiniteSegmentSampler) { $missingDirector += 'MiniMaxH3FiniteSegmentSampler' }
+    } elseif ([string]$Config.mode -eq 'ref2va') {
         if (-not $capabilities.MiniMaxH3ReferenceToVideo) { $missingCore += 'MiniMaxH3ReferenceToVideo' }
     } elseif (-not $capabilities.MiniMaxH3ImageToVideo) {
         $missingCore += 'MiniMaxH3ImageToVideo'
     }
     if (-not $capabilities.ResolutionSelector) { $missingCore += 'ResolutionSelector' }
-    if (-not $capabilities.ComfyMathExpression) { $missingCore += 'ComfyMathExpression' }
+    # ComfyMathExpression 只被三个基础模式的帧数表达式用到，导演台没有这个节点。
+    if ([string]$Config.mode -ne 'director' -and -not $capabilities.ComfyMathExpression) { $missingCore += 'ComfyMathExpression' }
     if (-not $capabilities.CreateVideo) { $missingCore += 'CreateVideo' }
-    # 四个工作流的输出节点都是官方内置的 SaveVideo，它是必需节点。
+    # 五个工作流的输出节点都是官方内置的 SaveVideo，它是必需节点。
     if (-not $capabilities.SaveVideo) { $missingCore += 'SaveVideo' }
+    if ($missingDirector.Count -gt 0) {
+        throw "「长视频导演台」需要 ComfyUI-MiniMaxH3-TimelineDirector 节点包，当前缺少：$($missingDirector -join '、')。请安装该节点包（Songssx/ComfyUI-MiniMaxH3-TimelineDirector）并重启 ComfyUI 后重试。"
+    }
     if ($missingCore.Count -gt 0) {
         throw "当前 ComfyUI 缺少必需节点：$($missingCore -join '、')。这些节点由较新版本 ComfyUI 内置（comfy_extras），请更新 ComfyUI 后重试（本项目在 0.34.5 上验证）。"
     }
@@ -1234,7 +2245,8 @@ function Build-Workflow {
         'minimaxH3图生视频基础加速流.json',
         'minimaxH3首尾帧视频基础加速流.json',
         '图片+音频参考加速ai提示词工作流.json',
-        'minimaxh3全能参考(图片+视频+音频)+ai提示词生成+加速+Lora.json'
+        'minimaxh3全能参考(图片+视频+音频)+ai提示词生成+加速+Lora.json',
+        'minimaxH3长视频导演台加速流.json'
     )
     $workflowFile = [string]$Config.workflowFile
     if ($allowedFiles -notcontains $workflowFile) { throw '不允许使用指定的工作流文件。' }
@@ -1245,6 +2257,12 @@ function Build-Workflow {
         # 新版文件本身已经是 API 工作流；保留旧版 UI 工作流的转换兼容。
         if ($workflow.PSObject.Properties['nodes']) { $workflow = Convert-UiWorkflowToApi $workflow }
         return Build-ReferenceWorkflow $Config $workflow $comfyUrl
+    }
+    if ([string]$Config.mode -eq 'director') {
+        # 导演台的工作流文件是 ComfyUI 画布导出的 UI 格式（用户在画布上改完直接导出），
+        # 提交前先转成 API 格式再注入参数。
+        if ($workflow.PSObject.Properties['nodes']) { $workflow = Convert-UiWorkflowToApi $workflow }
+        return Build-DirectorWorkflow $Config $workflow $comfyUrl $capabilities
     }
 
     $duration = [Math]::Max(1, [Math]::Min(15, [int]$Config.duration))
@@ -1300,6 +2318,9 @@ function Build-Workflow {
 
     if ($capabilities.TEspeed) {
         Set-InputValue $workflow '105:122' 'model' $speedModel
+        # 加速模式（standard / 4-step LoRA / 8-step LoRA）：只在节点确实被保留时才注入，
+        # 节点版本不支持时会给出明确提示，而不是让用户以为切换生效了。
+        Set-TespeedMode $workflow '105:122' $Config $comfyUrl
     } else {
         # 没有 TE-Speed 节点时把模型链直接接到采样器的 guider，跳过加速而不是报错。
         Add-BuildWarning '未检测到 TE-SpeedMiniMaxH3 加速节点，本次已跳过加速（生成会变慢，结果正常）。安装该节点包并重启 ComfyUI 后会自动恢复。'
@@ -1313,21 +2334,15 @@ function Build-Workflow {
     # /api/generate 在"提交前且队列空闲"时调用 ComfyUI 官方 /free 接口完成。
     Remove-WorkflowNode $workflow '105:130'
     Set-InputValue $workflow '92' 'video' @('105:91', 0)
-    # RTX 放大链从 CreateVideo 接入。
+    # RTX 放大链从 CreateVideo 接入；统一走 Add-RtxUpscaleLink 处理能力判断与降级提示。
+    # 未开启 RTX 时保持上面那条直连，不新增任何节点。
     $saveSource = '105:91'
-    $rtxScale = Get-RtxScaleValue $Config.rtxUpscaleScale
     if ($Config.rtxUpscale) {
-        # RTX 放大是可选的画质增强：没装节点包时跳过放大继续出片，而不是阻断整个生成。
-        if (-not $capabilities.RtxUpscale) {
-            Add-BuildWarning '未检测到 RTXVideoSuperResolution 节点（NVIDIA RTX Video 节点包），本次已跳过 RTX 放大，视频按原分辨率输出。安装节点包并重启 ComfyUI 后会自动恢复。'
-        } else {
-            $nextId = 1000
-            foreach ($property in $workflow.PSObject.Properties) {
-                try { $nextId = [Math]::Max($nextId, [int]$property.Name + 1) } catch {}
-            }
-            $videoOut = Add-RtxUpscaleChain $workflow $saveSource $rtxScale $nextId
-            Set-InputValue $workflow '92' 'video' @($videoOut, 0)
+        $nextId = 1000
+        foreach ($property in $workflow.PSObject.Properties) {
+            try { $nextId = [Math]::Max($nextId, [int]$property.Name + 1) } catch {}
         }
+        Set-InputValue $workflow '92' 'video' (Add-RtxUpscaleLink $workflow $saveSource $nextId $Config $capabilities)
     }
     return $workflow
 }
@@ -1907,6 +2922,11 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             # 都会把 $workflow 从单个对象污染成数组（v20260912 的全能参考 500 就是这么来的）。
             # 在这里拦下并给出明确原因，而不是把坏 payload 发给 ComfyUI 换回一句难懂的 500。
             if ($workflow -is [System.Array]) { throw '内部错误：工作流构建结果是数组而非对象（函数输出泄漏），已阻止提交，请反馈给作者。' }
+            # 提交前兼容层：按 ComfyUI 当前实际节点定义补齐缺失的必需输入。
+            # 上游自定义节点包升级后新增必需字段（如 TE-Speed 3.5 的 mode）时，工作流 JSON 快照
+            # 里没有该字段，ComfyUI 会判为 required_input_missing 并整体拒绝。这里自动补上，
+            # 无需改工作流 JSON；探测失败时静默跳过，不影响正常生成。
+            Complete-RequiredInputs $workflow $comfy
             $payload = @{ prompt = $workflow; client_id = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Depth 100 -Compress
             $remote = Invoke-Comfy 'POST' "$comfy/prompt" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
             if (-not $remote.Success) {
@@ -1927,7 +2947,97 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
             # fresh=1 强制重新探测（用户刚装完节点包时用）。
             $comfy = Get-ComfyUrl $ctx.Request
             $force = -not [string]::IsNullOrWhiteSpace([string]$ctx.Request.QueryString['fresh'])
-            Send-Json $ctx (Get-ComfyCapabilities $comfy -Force:$force)
+            $capabilities = Get-ComfyCapabilities $comfy -Force:$force
+            # 手动「测试连接」时连节点定义缓存一起清掉：用户刚更新过节点包，期望立刻看到新接口
+            # （例如 TE-Speed 3.5 新出现的 mode 候选），不能被 10 分钟的缓存挡住。
+            if ($force) { Clear-ComfyNodeSchemaCache $comfy }
+            # TE-Speed 加速模式的候选列表照读节点声明，不写死在前端：上游节点包新增模式时
+            # 网页下拉自动跟着变，不用改前端代码。多花一次 /object_info/<节点名>（自带缓存）。
+            # 探测失败与「节点没有 mode」（3.5 以前）在这里同样处理：前端都是禁用该下拉并显示原因，
+            # 区分它们对网页没有意义；下一次 /api/capabilities 会重新探测。
+            $tespeedModes = @(Get-ComfyChoiceOptions $comfy 'TESpeedMiniMaxH3' 'mode')
+            # 【为什么要复制一份】Get-ComfyCapabilities 返回的是 $script:CapabilityCache 里的**同一个对象引用**，
+            # 直接 Add-Member / 改属性会把「本次请求的探测结果」写进缓存本体：下一次读缓存时，
+            # 里面已经带着上一次算出来的 TEspeedModes，缓存对象的含义变得含混（谁写的、什么时候写的都说不清）。
+            # 复制成一个新的有序字典再挂字段，缓存保持纯净。
+            $payload = [ordered]@{}
+            foreach ($property in $capabilities.PSObject.Properties) {
+                $payload[$property.Name] = $property.Value
+            }
+            $payload['TEspeedModes'] = @($tespeedModes)
+            Send-Json $ctx $payload
+        }
+        elseif ($path -eq '/api/self-check' -and $method -eq 'GET') {
+            # 只读环境自检：告诉用户哪个模式还能用、缺什么、要装哪个包。
+            # 这里**刻意不抛 5xx** —— ComfyUI 没启动是很常见的状态，必须回一个结构化结果，
+            # 让网页能把「连不上 ComfyUI」和「缺节点」分开显示（都报红的话用户会以为装崩了）。
+            # fresh=1 强制重新探测，供用户刚装完节点包时点「重新检测」。
+            $comfy = $null
+            try {
+                $comfy = Get-ComfyUrl $ctx.Request
+                $force = -not [string]::IsNullOrWhiteSpace([string]$ctx.Request.QueryString['fresh'])
+                $capabilities = Get-ComfyCapabilities $comfy -Force:$force
+                $report = Get-SelfCheckReport $capabilities
+                $report | Add-Member -NotePropertyName comfyUrl -NotePropertyValue $comfy -Force
+                # 顺带探测 ComfyUI-Manager：装了它前端才能把「复制安装命令」升级成「一键安装」。
+                $report | Add-Member -NotePropertyName manager -NotePropertyValue (Get-ComfyManagerInfo $comfy) -Force
+                Send-Json $ctx $report
+            } catch {
+                Send-Json $ctx ([pscustomobject]@{
+                    connected = $false
+                    comfyUrl  = [string]$comfy
+                    error     = $_.Exception.Message
+                })
+            }
+        }
+        elseif ($path -eq '/api/install-package' -and $method -eq 'POST') {
+            # 一键安装缺失的节点包：转发给 ComfyUI-Manager 的 POST /customnode/install/git_url
+            # （body 为 JSON {"url": ...}，接口清单取自 Manager 源码 glob/manager_server.py）。
+            #
+            # 【安全】请求体里只接受**包名**，仓库地址由服务端 Get-InstallablePackage 从登记表反查，
+            # 所以这个接口不可能被诱导去安装登记表之外的仓库。另与 /api/apply-update 保持一致的
+            # 两道闸：要求 application/json（跨站表单发不出该 Content-Type，挡 CSRF）+ 同源校验。
+            #
+            # 注意：这里刻意不用 return —— 本段位于脚本顶层的主循环里，return 会直接结束整个服务。
+            if ($ctx.Request.ContentType -notmatch 'application/json') { throw '请通过页面内的「一键安装」按钮执行安装。' }
+            Assert-SameOrigin $ctx.Request
+            Assert-RequestSize $ctx.Request 65536 '安装请求过大。'
+            $bodyBytes = Read-RequestBytes $ctx.Request
+            $bodyObject = [Text.Encoding]::UTF8.GetString($bodyBytes) | ConvertFrom-Json
+            $packageName = [string]$bodyObject.package
+            if ([string]::IsNullOrWhiteSpace($packageName)) { throw '安装请求缺少 package 字段。' }
+
+            $target = Get-InstallablePackage $packageName
+            if (-not $target) { throw "「$packageName」不在可安装清单里（本站只允许安装自检面板列出的节点包）。" }
+            if ($target.isCore) { throw '这些是 ComfyUI 内置节点，请更新 ComfyUI，而不是安装节点包。' }
+            if (-not $target.url) { throw "未登记「$packageName」的仓库地址，请在 ComfyUI-Manager 中按节点名搜索安装。" }
+
+            $comfy = Get-ComfyUrl $ctx.Request $bodyObject
+            if (-not (Get-ComfyManagerInfo $comfy).available) {
+                throw '未检测到 ComfyUI-Manager，请先安装它，或改用「复制安装命令」手动安装。'
+            }
+
+            $payload = @{ url = [string]$target.url } | ConvertTo-Json -Compress
+            $remote = Invoke-Comfy 'POST' "$comfy/customnode/install/git_url" ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json'
+            if ($remote.Success) {
+                Send-Json $ctx ([pscustomobject]@{
+                    ok      = $true
+                    message = "已提交 $packageName 的安装，装好后需要重启 ComfyUI 才会生效。"
+                })
+            } else {
+                # Manager 的 403 带机器可读的 flag_token，直接抛给用户只会看到一个英文标识符，
+                # 这里翻译成能照着做的说明。
+                $detail = [Text.Encoding]::UTF8.GetString($remote.Bytes)
+                $hint = "ComfyUI-Manager 拒绝安装（HTTP $($remote.StatusCode)）：$detail"
+                if ($detail -match 'comfyui_outdated') {
+                    $hint = 'ComfyUI 版本过旧，ComfyUI-Manager 拒绝执行 Git 安装。请先更新 ComfyUI。'
+                } elseif ($detail -match 'allow_git_url_install') {
+                    $hint = 'ComfyUI-Manager 没开启 Git URL 安装（配置项 allow_git_url_install），或 ComfyUI 不是以本机（loopback）模式启动。请改用「复制安装命令」手动安装。'
+                } elseif ($detail -match 'security_level') {
+                    $hint = 'ComfyUI-Manager 的 security_level 设置不允许该安装，请在 Manager 面板调整后重试，或改用「复制安装命令」。'
+                }
+                throw $hint
+            }
         }
         elseif ($path -eq '/api/debug-workflow' -and $method -eq 'POST') {
             $bodyBytes = Read-RequestBytes $ctx.Request
@@ -1955,6 +3065,8 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
                 $debug.teControl = $speed.inputs.processing_control_value
                 $debug.tePercent1 = $speed.inputs.processing_percent_1
                 $debug.tePercent2 = $speed.inputs.processing_percent_2
+                # mode 只在 TE-Speed 3.5+ 才有；旧版节点读到的会是 $null，正好用来判断节点版本。
+                $debug.teMode = $speed.inputs.mode
                 $debug.speedModel = $speed.inputs.model
                 if ($workflow.PSObject.Properties['167']) {
                     $debug.loraText = (Get-Node $workflow '167').inputs.text

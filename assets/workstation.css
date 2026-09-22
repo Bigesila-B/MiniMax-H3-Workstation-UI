@@ -220,7 +220,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 
 .segmented-control {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* 五个模式：文生 / 图生 / 首尾帧 / 全能参考 / 长视频导演台。
+     窄屏下在上方的媒体查询里退回三列（3 + 2 两行），避免「长视频导演台」被压到换行。 */
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 5px;
   padding: 5px;
   border: 1px solid var(--border);
@@ -428,6 +430,19 @@ body.drag-over::after {
 
 .input-with-button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .icon-button { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); padding: 0 10px; color: var(--muted); }
+/* 采样器下拉：贴在输入框右侧，作为「从本机列表里挑」的入口。
+   .field select 那条规则带 width:100%，这里用两级类名提高优先级把它压回去，
+   否则下拉会撑满整行、把输入框挤没。
+   宽度压到 100px 以内：下拉里始终显示「选择…」这种短标签，真实采样器名只在展开时才需要宽度，
+   收窄后左边的输入框才有足够空间显示完整名称。 */
+.field .sampler-picker {
+  width: auto;
+  max-width: 100px;
+  padding: 11px 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.field .sampler-picker:disabled { cursor: not-allowed; opacity: .55; }
 
 .generate-bar {
   display: flex;
@@ -480,10 +495,177 @@ body.drag-over::after {
 .status-list li { display: flex; align-items: center; gap: 9px; }
 .check-mark { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: #edf8f1; color: var(--success); font-size: 12px; font-weight: 900; }
 
+/* ===== 环境自检面板 =====
+   取代原先写死的「工作流状态」四条 ✓（那四条永远全绿，从不反映真实情况）。
+   数据来自 GET /api/self-check，纯只读诊断：缺可选节点仍照旧降级出片，
+   这个面板只负责把事实讲清楚，不参与任何生成决策。 */
+.self-check-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.self-check-head h2 { margin-bottom: 0; }
+.self-check-head .button { flex: none; }
+
+.self-check-summary { margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.self-check-summary .is-ok { color: var(--success); font-weight: 700; }
+.self-check-summary .is-soft { color: #ba7517; font-weight: 700; }
+.self-check-summary .is-bad { color: var(--danger); font-weight: 700; }
+
+.self-check-modes { display: grid; gap: 7px; margin: 0 0 12px; padding: 0; list-style: none; }
+.self-check-mode { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+.self-check-mode-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.self-check-mode-state { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 12px; font-weight: 700; }
+/* 小圆点用 currentColor，状态色跟着 class 走，不用重复定义三份背景 */
+.self-check-mode-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.self-check-mode.is-ok .self-check-mode-state { color: var(--success); }
+.self-check-mode.is-degraded .self-check-mode-state { color: #ba7517; }
+.self-check-mode.is-unavailable .self-check-mode-state { color: var(--danger); }
+.self-check-mode.is-unknown .self-check-mode-state { color: var(--muted); }
+
+.self-check-packages { display: grid; gap: 9px; }
+.self-check-package { border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); padding: 10px 12px; font-size: 12px; line-height: 1.65; }
+.self-check-package.is-core { border-color: rgba(183, 72, 72, .3); background: #fff5f5; }
+.self-check-package-name { display: block; font-weight: 700; word-break: break-word; }
+.self-check-package-nodes { margin: 3px 0 0; color: var(--muted); word-break: break-word; }
+.self-check-package-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+.self-check-package-actions .button { min-height: 30px; padding: 5px 10px; font-size: 12px; }
+.self-check-hint { margin: 0; color: var(--muted); font-size: 12px; }
+
 .capability-note { grid-column: 1 / -1; margin: 0; padding: 10px 12px; border: 1px solid rgba(186,117,23,.35); border-radius: 12px; background: #fdf6e9; color: var(--text); font-size: 12px; line-height: 1.7; }
 .capability-note strong { font-weight: 600; }
 .capability-note ul { margin: 6px 0 0; padding-left: 18px; }
 .capability-note li { margin: 3px 0; }
+
+/* ===== 高级参数面板：分组网格 =====
+   原先 7 个参数 + 2 个开关 + 1 个按钮 + 1 条提示全部平铺在同一个三列网格里：
+     1) 项数除不尽三列，最后一行残缺（RTX 放大倍数孤零零占一格）；
+     2) 网格默认 align-items: stretch 会把同排较矮的 .field 拉伸到整行高度，
+        标题行与控件行被一起撑高，控件于是「上上下下」对不齐；
+     3) 采样器 / TE-Speed 加速模式两格带说明文字，比同排其它格高，进一步放大错位。
+   现在按语义拆成「采样 / TE-Speed 加速 / 画质增强 / 显存管理」四组，
+   每组列数取整（3 或 2），并用 align-items: start 让同排控件顶到同一条基线。 */
+.advanced-params { display: grid; gap: 20px; }
+
+.param-group { display: grid; gap: 12px; }
+.param-group-head { display: flex; align-items: center; gap: 10px; }
+.param-group-title {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+/* 分组标题右侧拉一条细分割线，让四组之间的界限一眼可见 */
+.param-group-head::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--border); }
+
+.param-grid { display: grid; gap: 15px; align-items: start; }
+.param-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.param-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+/* 关键修复：禁止网格把单个 .field 拉满整行高度，标题与控件之间的 gap 不再被撑开，
+   同一行里的输入框/下拉框因此落在同一水平线上。 */
+.param-grid > .field { align-content: start; }
+/* 开关卡片在双列组里各占一格（原样式是整行，这里放宽） */
+.param-grid > .rtx-upscale-switch,
+.param-grid > .vram-clean-switch { grid-column: auto; }
+/* 显存管理组：开关与「立即清理」按钮行各占整行，纵向堆叠 */
+.param-grid > .vram-clean-action { grid-column: 1 / -1; }
+/* <select> 自带行高比 <input> 多 2px（实测 46 vs 44），同排并排时会轻微错位；统一到同一高度 */
+.advanced-params .field input:not([type="range"]),
+.advanced-params .field select { height: 44px; }
+
+/* 折叠面板展开后与顶部分割线之间留出呼吸感（原来靠 .details-content > .settings-grid 那条规则，容器改名后补一条） */
+.details-content.advanced-params { padding-top: 20px; }
+
+/* ===== 长视频导演台：分镜编排 ===== */
+.segment-list { display: grid; gap: 12px; }
+/* 没有追加分镜时不占位（保留单段语义） */
+.segment-list:empty { display: none; }
+.segment-row {
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-soft);
+}
+.segment-row-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.segment-index { color: var(--muted); font-size: 12px; font-weight: 800; letter-spacing: .06em; }
+.remove-segment {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 5px 10px;
+  background: white;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 700;
+}
+.remove-segment:hover { border-color: var(--danger); background: #fff5f4; }
+.segment-row-body { display: grid; grid-template-columns: minmax(0, 1fr) 132px; gap: 12px; align-items: start; }
+.segment-row-body .field textarea { min-height: 96px; }
+.segment-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.segment-actions > small { color: var(--muted); font-size: 12px; }
+/* 二采超分开关：沿用显存清理开关那种「卡片式开关」，和高级参数面板观感一致 */
+.director-secondpass-switch {
+  align-items: flex-start;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+.director-secondpass-switch > span:last-child { display: grid; gap: 3px; }
+.director-secondpass-switch strong { color: var(--text); font-size: 13px; }
+.director-secondpass-switch small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+
+/* 分段里的「本段参考图片 / 参考音频」勾选器：候选来自上方「参考素材」区已加入的文件 */
+.segment-materials { grid-column: 1 / -1; }
+.segment-material-options { display: flex; flex-wrap: wrap; gap: 7px; }
+.segment-material-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 10px 4px 5px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: white;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.segment-material-option:hover { border-color: var(--accent); background: var(--accent-soft); }
+/* 未勾选的素材整块压暗，一眼能看出这一段取了哪些、舍了哪些 */
+.segment-material-option:has(input:not(:checked)) { opacity: .5; }
+/* 预览小图：图片显示实际画面，音频用音符占位 */
+.segment-material-thumb {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border-radius: 7px;
+  background: var(--surface-strong);
+  color: var(--muted);
+  font-size: 14px;
+}
+.segment-material-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.segment-material-thumb.is-audio { background: var(--accent-soft); color: var(--accent); font-weight: 800; }
+/* 优先级必须高过 .field input:not([type="range"])（它带 width:100% + padding），
+   否则勾选框会被撑成整行宽的大方块、把后面的文件名挤没。 */
+.segment-materials .segment-material-option input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: 4px;
+  accent-color: var(--accent);
+}
+.segment-material-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 「全局提示词 / 分段提示词」冲突时的提示用警示色（定义在 .config-hint 之后，直接覆盖其颜色） */
+.director-hint-warn { color: var(--warning); }
+
+/* 导演台模式下「视频时长」被隐藏，这一行网格改成两列，免得留一个空格子 */
+.timing-panel.director-mode .three-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
 .toast-region { position: fixed; z-index: 50; right: 18px; bottom: 18px; display: grid; gap: 9px; width: min(380px, calc(100vw - 28px)); pointer-events: none; }
 .toast { padding: 13px 15px; border: 1px solid var(--border-strong); border-radius: 13px; background: rgba(255,255,255,.96); box-shadow: 0 18px 45px rgba(20,22,25,.16); color: var(--text); font-size: 13px; line-height: 1.5; animation: toast-in .2s ease both; }
@@ -529,7 +711,12 @@ body.drag-over::after {
   .image-reading-switch { grid-column: auto; }
   .textarea-meta { align-items: flex-end; }
   .textarea-meta span:first-child { max-width: 70%; }
-  .settings-grid.two-columns, .settings-grid.three-columns { grid-template-columns: 1fr; }
+  .settings-grid.two-columns, .settings-grid.three-columns,
+  .param-grid.cols-2, .param-grid.cols-3 { grid-template-columns: 1fr; }
+  /* 五个模式在窄屏改两行三列，别把「长视频导演台」压到换行 */
+  .segmented-control { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  /* 分镜卡片：提示词与时长改为上下排列 */
+  .segment-row-body { grid-template-columns: 1fr; }
   .collapsible-panel summary { padding: 17px 15px; }
   .summary-note { max-width: 42%; text-align: right; }
   .details-content { padding: 2px 15px 17px; }
