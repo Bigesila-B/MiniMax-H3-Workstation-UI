@@ -478,9 +478,16 @@ body.drag-over::after {
 .task-status[data-status="failed"] { color: var(--danger); }
 .task-status[data-status="recovering"] { color: var(--warning); }
 .task-status[data-status="queued"], .task-status[data-status="running"] { color: #4d6ea6; }
+/* 「已停止」是用户主动停下来的中性结果，不该像 failed 那样报红，也不该像 success 那样报绿。 */
+.task-status[data-status="cancelled"] { color: var(--muted); }
 .task-message { margin: 9px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; word-break: break-word; }
 .task-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
 .task-actions a, .task-actions button { border: 1px solid var(--border); border-radius: 9px; background: white; color: var(--text); padding: 7px 9px; text-decoration: none; font-size: 12px; font-weight: 700; }
+/* 停止任务：卡片上唯一的按钮，用红色描边与文字表明它是"会打断生成"的那一个，
+   但不做填充红，避免整天占着视觉重心。 */
+.task-actions .task-stop-button { border-color: rgba(183,72,72,.34); color: var(--danger); }
+.task-actions .task-stop-button:hover { border-color: rgba(183,72,72,.6); background: #fff5f4; }
+.task-actions .task-stop-button:disabled { opacity: .6; cursor: progress; }
 .progress-track { height: 5px; background: #e2e6eb; overflow: hidden; }
 .progress-track span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s ease; }
 .progress-track.indeterminate span { width: 42%; animation: progress-move 1.4s ease-in-out infinite alternate; }
@@ -527,6 +534,27 @@ body.drag-over::after {
 .self-check-package-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
 .self-check-package-actions .button { min-height: 30px; padding: 5px 10px; font-size: 12px; }
 .self-check-hint { margin: 0; color: var(--muted); font-size: 12px; }
+
+/* ===== 性能监控面板 =====
+   数据来自 GET /api/system-stats，只读展示服务端机器的硬件状态。
+   面板默认折叠、展开期间每 1 秒轮询，收起即停止（服务端采集走 WMI / nvidia-smi，
+   不是免费操作）；进度条颜色分级：≥75% 转警示黄、≥90% 转危险红。 */
+.perf-panel .details-content { padding-top: 17px; }
+.perf-grid { display: grid; gap: 14px; }
+.perf-section-title { display: block; margin-bottom: 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--subtle); }
+.perf-row { display: grid; gap: 5px; }
+.perf-row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 13px; }
+.perf-row-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perf-row-value { flex: none; font-weight: 700; font-variant-numeric: tabular-nums; }
+.perf-row-detail { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perf-bar { height: 7px; border-radius: 99px; background: var(--surface-strong); overflow: hidden; }
+.perf-bar-fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width .6s ease; }
+.perf-bar-fill.is-warn { background: #ba7517; }
+.perf-bar-fill.is-bad { background: var(--danger); }
+.perf-note { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.perf-grid .perf-note { margin: 0; }
+.perf-note.is-error { color: var(--danger); }
+
 
 .capability-note { grid-column: 1 / -1; margin: 0; padding: 10px 12px; border: 1px solid rgba(186,117,23,.35); border-radius: 12px; background: #fdf6e9; color: var(--text); font-size: 12px; line-height: 1.7; }
 .capability-note strong { font-weight: 600; }

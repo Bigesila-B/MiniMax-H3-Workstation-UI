@@ -1,3 +1,5 @@
+import { createLoraLibrary } from "./lora-library.js?v=20261012-7";
+
 const WORKFLOW_FILES = {
   t2v: "minimaxH3文生视频基础加速流.json",
   i2v: "minimaxH3图生视频基础加速流.json",
@@ -110,6 +112,15 @@ const MAX_POLL_DURATION_MS = 6 * 60 * 60 * 1000; // 6 小时
 // 连续查询失败达到该次数时，停止轮询并明确告知用户（而不是无限重试）。
 const MAX_QUERY_FAILURES = 60;
 
+// 任务的「终结状态」：到达后不再自动查询，也不再显示「停止任务」按钮。
+//  - success / failed 是 ComfyUI 给出的结果；
+//  - cancelled 既是本地判定的「用户点了停止任务」，也是识别到 ComfyUI 侧中断（execution_interrupted）
+//    后的结论；它和 failed 分开，是为了不把「用户主动停掉」显示成「生成失败」。
+const TERMINAL_TASK_STATUSES = ["success", "failed", "cancelled"];
+function isTaskTerminal(task) {
+  return TERMINAL_TASK_STATUSES.includes(task?.status);
+}
+
 const $ = (id) => document.getElementById(id);
 const elements = {
   connectionPill: $("connectionPill"), connectionText: $("connectionText"), comfyUrl: $("comfyUrl"), connectionHint: $("connectionHint"),
@@ -142,7 +153,33 @@ const elements = {
   // 环境自检面板（取代原先写死的「工作流状态」四条 ✓）
   selfCheckRefresh: $("selfCheckRefresh"), selfCheckSummary: $("selfCheckSummary"),
   selfCheckModes: $("selfCheckModes"), selfCheckPackages: $("selfCheckPackages"),
+  // 性能监控面板（折叠式，展开期间轮询 /api/system-stats）
+  perfPanel: $("perfPanel"), perfGrid: $("perfGrid"), perfSummaryNote: $("perfSummaryNote"),
 };
+
+const loraLibrary = createLoraLibrary({
+  apiUrl, fetchJson, toast,
+  getComfy: () => normalizeComfyUrl(),
+  getLoras: () => state.loras,
+  syncNames: (names) => {
+    state.models.lora = names;
+    if (state.loraModeDefaults) syncAutomaticLora();
+    else state.loras = state.loras.map((item) => ({ ...item, name: findModelName(names, item.name) || item.name }));
+    renderLoras(); saveSettings();
+  },
+  add: (name) => {
+    if (state.loras.some((item) => item.name === name)) return;
+    state.loraModeDefaults = false;
+    state.loras.push({ name, strength: 1, active: true });
+    renderLoras(); saveSettings();
+  },
+  remove: (names) => {
+    state.loraModeDefaults = false;
+    state.loras = state.loras.filter((item) => !names.includes(item.name));
+    state.models.lora = state.models.lora.filter((name) => !names.includes(name));
+    renderLoras(); saveSettings();
+  },
+});
 
 function normalizeComfyUrl(value = elements.comfyUrl.value) {
   return value.trim().replace(/\/+$/, "");
@@ -1164,6 +1201,259 @@ async function loadSelfCheck(comfyUrl, force = false) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 性能监控面板：只读展示服务端所在机器的 CPU / 内存 / 显卡占用与显卡温度。
+// 数据来自 GET /api/system-stats —— 服务端那份快照由**后台常驻采集线程**每约 500ms
+// 刷新一次（CPU/内存走常驻性能计数器、显卡走常驻 nvidia-smi 流，一轮约 1 毫秒），
+// 接口只读内存快照，所以这里可以按秒级轮询而不给服务端增加负担。
+// 【为什么固定 1 秒、不做档位】1 秒已经是"实时感"的上限：采集线程本身约 500ms 一轮，
+// 再快也只是把同一份快照多读几遍。少一个下拉，少一处状态，少一类"改了档位没生效"的疑问。
+// 【为什么仍然只在面板展开时轮询】服务端不疼了，但没必要在没人看的时候白白发请求、
+// 白白重绘：面板默认折叠，展开才轮询；页面切到后台（visibilitychange）同样暂停。
+// 【为什么渲染必须"就地更新"】1 秒一刷如果每次都 replaceChildren()，进度条元素每秒
+// 被重建一次，CSS 的 width 过渡永远来不及触发（新元素直接以目标宽度出生），
+// 看上去就是数字在跳、条子在闪。所以按稳定的 key 复用已有的行元素。
+// ---------------------------------------------------------------------------
+const PERF_POLL_INTERVAL_MS = 1000;
+const perfState = { timer: null, busy: false, failureCount: 0 };
+
+function perfStatus(text) {
+  if (elements.perfSummaryNote) elements.perfSummaryNote.textContent = text;
+}
+
+function perfBarClass(percent) {
+  if (percent == null) return "";
+  if (percent >= 90) return " is-bad";
+  if (percent >= 75) return " is-warn";
+  return "";
+}
+
+function perfPercentText(percent) {
+  return percent == null ? "—" : `${Math.round(percent)}%`;
+}
+
+// 进度条只在"这一行需要进度条"时存在；数值没变就不动 DOM（避免无谓重排）。
+function perfFillBar(row, percent) {
+  let bar = row.querySelector(".perf-bar");
+  if (percent == null) {
+    if (bar) bar.remove();
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "perf-bar";
+    const created = document.createElement("div");
+    created.className = "perf-bar-fill";
+    bar.appendChild(created);
+    row.appendChild(bar);
+  }
+  const fill = bar.firstElementChild;
+  const nextClass = `perf-bar-fill${perfBarClass(percent)}`.trim();
+  if (fill.className !== nextClass) fill.className = nextClass;
+  const nextWidth = `${Math.max(0, Math.min(100, percent))}%`;
+  if (fill.style.width !== nextWidth) fill.style.width = nextWidth;
+}
+
+// 按 key 取回（必要时新建）一行指标。key 是这一行在面板里的稳定身份：
+// 只要 key 不变，元素就一直被复用，进度条的 width 过渡才有机会真正播放。
+// 【注意】新建后必须先挂进 grid：perfReconcile 只重排"已经在树上的元素"，
+// 没挂上去的行会被它当作不存在，结果是分组标题都在、数据一行都不显示。
+function perfEnsureRow(grid, key) {
+  let row = grid.querySelector(`[data-perf-key="${key}"]`);
+  if (row) return row;
+  row = document.createElement("div");
+  row.className = "perf-row";
+  row.dataset.perfKey = key;
+  const top = document.createElement("div");
+  top.className = "perf-row-top";
+  const label = document.createElement("span");
+  label.className = "perf-row-label";
+  const value = document.createElement("span");
+  value.className = "perf-row-value";
+  top.append(label, value);
+  row.appendChild(top);
+  grid.appendChild(row);
+  return row;
+}
+
+// 一行指标 = 「标签 + 数值」+（可选）副标题 +（可选）进度条。全部就地更新。
+function perfFillRow(row, label, valueText, detail = "", percent = null) {
+  row.querySelector(".perf-row-label").textContent = label;
+  row.querySelector(".perf-row-value").textContent = valueText;
+  let sub = row.querySelector(".perf-row-detail");
+  if (detail) {
+    if (!sub) {
+      sub = document.createElement("span");
+      sub.className = "perf-row-detail";
+      row.appendChild(sub);
+    }
+    if (sub.textContent !== detail) sub.textContent = detail;
+  } else if (sub) {
+    sub.remove();
+  }
+  perfFillBar(row, percent);
+}
+
+function perfEnsureSectionTitle(grid, key, text) {
+  let el = grid.querySelector(`[data-perf-key="${key}"]`);
+  if (!el) {
+    el = document.createElement("span");
+    el.className = "perf-section-title";
+    el.dataset.perfKey = key;
+    grid.appendChild(el);
+  }
+  if (el.textContent !== text) el.textContent = text;
+  return el;
+}
+
+// 按 order 把已有元素重排成目标顺序，并删掉这一轮不再需要的元素。
+// 只移动/删除，不重建 —— 重建会让进度条动画和输入焦点一并丢失。
+function perfReconcile(grid, order) {
+  const present = new Map();
+  for (const child of Array.from(grid.children)) {
+    if (child.dataset.perfKey) present.set(child.dataset.perfKey, child);
+  }
+  const keep = new Set(order);
+  let cursor = grid.firstElementChild;
+  for (const key of order) {
+    const el = present.get(key);
+    if (!el) continue;
+    if (el === cursor) {
+      cursor = cursor.nextElementSibling;
+      continue;
+    }
+    grid.insertBefore(el, cursor);
+  }
+  for (const [key, el] of present) {
+    if (!keep.has(key)) el.remove();
+  }
+}
+
+function renderPerfStats(stats) {
+  const grid = elements.perfGrid;
+  if (!grid || !stats) return;
+  const order = [];
+
+  const errors = Array.isArray(stats.errors) ? stats.errors.filter(Boolean) : [];
+  if (errors.length) {
+    const key = "note";
+    let note = grid.querySelector(`[data-perf-key="${key}"]`);
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "perf-note is-error";
+      note.dataset.perfKey = key;
+      grid.appendChild(note);
+    }
+    note.textContent = errors.join("　");
+    order.push(key);
+  }
+
+  // ---- CPU ----
+  const cpu = stats.cpu || {};
+  if (cpu.name || cpu.loadPercent != null) {
+    perfEnsureSectionTitle(grid, "title:cpu", "处理器");
+    order.push("title:cpu");
+    const details = [];
+    if (cpu.name) details.push(cpu.name);
+    if (cpu.logicalCores) details.push(`${cpu.logicalCores} 线程`);
+    perfFillRow(perfEnsureRow(grid, "row:cpu"), "CPU 占用", perfPercentText(cpu.loadPercent), details.join(" · "), cpu.loadPercent);
+    order.push("row:cpu");
+  }
+
+  // ---- 内存 ----
+  const memory = stats.memory || {};
+  if (memory.totalGb != null) {
+    perfEnsureSectionTitle(grid, "title:memory", "内存");
+    order.push("title:memory");
+    const label = memory.usedGb != null ? `${memory.usedGb} / ${memory.totalGb} GB` : `${memory.totalGb} GB`;
+    perfFillRow(perfEnsureRow(grid, "row:memory"), "内存占用", `${perfPercentText(memory.usedPercent)} · ${label}`, "", memory.usedPercent);
+    order.push("row:memory");
+  }
+
+  // ---- 显卡 ----
+  const gpus = Array.isArray(stats.gpus) ? stats.gpus : [];
+  if (gpus.length) {
+    perfEnsureSectionTitle(grid, "title:gpu", "显卡");
+    order.push("title:gpu");
+    gpus.forEach((gpu, index) => {
+      if (gpu.utilizationPercent == null && gpu.memoryTotalMb == null) {
+        // 没有 nvidia-smi 时的 WMI 兜底：只有型号，没有占用/温度可报。
+        const key = `row:gpu:${index}:name`;
+        perfFillRow(perfEnsureRow(grid, key), gpu.name || "显卡", "占用 / 温度不可用", "未检测到 NVIDIA 驱动（nvidia-smi）。", null);
+        order.push(key);
+        return;
+      }
+      const tempParts = [];
+      if (gpu.temperatureC != null) tempParts.push(`${gpu.temperatureC}℃`);
+      if (gpu.powerW != null) tempParts.push(`${gpu.powerW}W`);
+      const utilKey = `row:gpu:${index}:util`;
+      perfFillRow(
+        perfEnsureRow(grid, utilKey),
+        "GPU 占用",
+        [perfPercentText(gpu.utilizationPercent)].concat(tempParts).join(" · "),
+        gpu.name || "",
+        gpu.utilizationPercent
+      );
+      order.push(utilKey);
+      if (gpu.memoryTotalMb) {
+        const usedMb = gpu.memoryUsedMb || 0;
+        const vramPercent = (usedMb / gpu.memoryTotalMb) * 100;
+        const vramKey = `row:gpu:${index}:vram`;
+        perfFillRow(
+          perfEnsureRow(grid, vramKey),
+          "显存",
+          `${perfPercentText(vramPercent)} · ${(usedMb / 1024).toFixed(1)} / ${(gpu.memoryTotalMb / 1024).toFixed(1)} GB`,
+          "",
+          vramPercent
+        );
+        order.push(vramKey);
+      }
+    });
+  }
+
+  perfReconcile(grid, order);
+}
+
+async function pollPerfStats() {
+  if (perfState.busy || !elements.perfPanel?.open) return;
+  perfState.busy = true;
+  try {
+    // 10 秒：接口读的是服务端内存快照，正常情况下几毫秒就返回；
+    // 只有服务端采集线程异常、退回按需采集时才可能慢到接近 1 秒。
+    const stats = await fetchJson(apiUrl("/api/system-stats"), {}, 10000);
+    perfState.failureCount = 0;
+    renderPerfStats(stats);
+    // 服务端采集线程没在工作时如实说明，而不是让人以为面板坏了 ——
+    // 这时数据仍是现场采的，只是刷新会明显变慢。
+    const degraded = stats.collector && stats.collector.fresh === false;
+    perfStatus(degraded ? "自动刷新中 · 服务端采集降级（按需采集）" : "自动刷新中");
+  } catch {
+    // 失败不清空最后一次成功的数据，只在摘要处提示；连续失败也静默重试。
+    perfState.failureCount += 1;
+    if (perfState.failureCount === 1) perfStatus("刷新失败，将自动重试…");
+  } finally {
+    perfState.busy = false;
+  }
+}
+
+function startPerfPolling() {
+  if (perfState.timer) return;
+  if (!elements.perfPanel?.open) return;
+  perfStatus("自动刷新中");
+  pollPerfStats();
+  perfState.timer = setInterval(pollPerfStats, PERF_POLL_INTERVAL_MS);
+}
+
+function stopPerfPolling(reason = "collapsed") {
+  if (perfState.timer) {
+    clearInterval(perfState.timer);
+    perfState.timer = null;
+  }
+  if (elements.perfPanel) {
+    perfStatus(reason === "hidden" ? "已暂停（页面在后台，切回自动恢复）" : "已暂停（展开后自动恢复）");
+  }
+}
+
 // 服务端在构建工作流时若跳过了可选节点，会在提交结果里带上 warnings。
 // 分两类处理：
 //   1) 能力降级类（「未检测到 XXX 节点」）——汇总成一条。逐条原因已常驻在「高级参数」的
@@ -1213,7 +1503,7 @@ async function scanModels() {
       try {
         const result = await fetchJson(apiUrl(`/api/model-list?type=${encodeURIComponent(type)}`), {}, 60000);
         return Array.isArray(result) ? result : Array.isArray(result?.files) ? result.files : [];
-      } catch { return []; }
+      } catch (error) { if (type === "loras") throw error; return []; }
     };
     const [unetFiles, clipFiles, vaeFiles, loraFiles] = await Promise.all([
       readModelFolder("diffusion_models"), readModelFolder("text_encoders"), readModelFolder("vae"), readModelFolder("loras"),
@@ -1245,6 +1535,7 @@ async function scanModels() {
           .filter((lora) => state.models.lora.includes(lora.name));
     syncAutomaticLora();
     renderLoras();
+    await loraLibrary.refresh();
 
     const total = state.models.unet.length + state.models.clip.length + state.models.vae.length + state.models.lora.length;
     elements.modelScanStatus.textContent = total ? `已发现 ${total} 个候选` : "未扫描到可用模型";
@@ -1260,7 +1551,8 @@ async function scanModels() {
 
 function renderLoras() {
   elements.loraList.replaceChildren();
-  elements.loraEmpty.classList.toggle("hidden", state.loras.length > 0);
+  elements.loraEmpty.classList.toggle("hidden", state.loras.some((item) => item.active !== false && item.name));
+  loraLibrary.updateSelection();
   state.loras.forEach((lora, index) => {
     const row = document.createElement("div");
     row.className = "lora-row";
@@ -1269,11 +1561,12 @@ function renderLoras() {
     active.type = "checkbox";
     active.checked = lora.active !== false;
     active.title = "启用此 LoRA";
-    active.addEventListener("change", () => { state.loraModeDefaults = false; state.loras[index].active = active.checked; saveSettings(); });
+    active.addEventListener("change", () => { state.loraModeDefaults = false; state.loras[index].active = active.checked; elements.loraEmpty.classList.toggle("hidden", state.loras.some((item) => item.active !== false && item.name)); loraLibrary.updateSelection(); saveSettings(); });
 
     const select = document.createElement("select");
     state.models.lora.forEach((name) => appendOption(select, name));
-    select.value = state.models.lora.includes(lora.name) ? lora.name : state.models.lora[0] || "";
+    if (lora.name && !state.models.lora.includes(lora.name)) appendOption(select, lora.name, `未找到：${lora.name}`);
+    select.value = lora.name || state.models.lora[0] || "";
     select.disabled = !state.models.lora.length;
     select.addEventListener("change", () => {
       state.loraModeDefaults = false;
@@ -1773,6 +2066,13 @@ function historyStatus(historyItem) {
   const progressValue = progressMessage?.[1]?.value ?? progressMessage?.[1]?.progress;
   const progress = Number.isFinite(Number(progressValue)) ? Math.max(0, Math.min(100, Number(progressValue) <= 1 ? Number(progressValue) * 100 : Number(progressValue))) : null;
   const executionError = messages.find((entry) => Array.isArray(entry) && entry[0] === "execution_error");
+  // 中断与报错必须分开判：ComfyUI 在 /interrupt 后往历史里写的是 execution_interrupted
+  // （而不是 execution_error），但它同样会把 status_str 记成 error。若先按 error 判，用户自己
+  // 停掉的任务会在别的标签页里被显示成「生成失败」。所以中断优先。
+  const interrupted = messages.find((entry) => Array.isArray(entry) && entry[0] === "execution_interrupted");
+  if (interrupted) {
+    return { terminal: true, status: "cancelled", progress: 0, message: "任务已在 ComfyUI 中被中断（已停止）。" };
+  }
   if (status.status_str === "error" || executionError) {
     const detail = executionError?.[1]?.exception_message || executionError?.[1]?.node_type || "ComfyUI 明确返回执行错误";
     return { terminal: true, status: "failed", progress: 0, message: detail };
@@ -1795,7 +2095,7 @@ function historyStatus(historyItem) {
 
 async function queryTask(taskId, manual = false) {
   const task = state.tasks.find((item) => item.id === taskId);
-  if (!task || task.status === "success" || task.status === "failed") return;
+  if (!task || isTaskTerminal(task)) return;
   try {
     const data = await fetchJson(apiUrl(`/api/history/${encodeURIComponent(task.id)}`, task.comfyUrl), {}, 45000);
     const historyItem = data[task.id] || data.prompt || null;
@@ -1847,6 +2147,10 @@ async function queryTask(taskId, manual = false) {
     task.status = "failed";
     task.progress = task.progress || 0;
     task.message = stopReason;
+    // 标记「这次失败是兜底停下来的」，而不是 ComfyUI 真的报了错。
+    // 有它任务卡片才会保留一个「重新查询」入口 —— 否则任务会被钉死在失败态，
+    // 而提示里还写着「可以再查一次」，用户却找不到任何能点的按钮。
+    task.pollingStopped = true;
     // 只在自动轮询时提示一次，避免手动刷新后反复弹同一个提示。
     if (wasPolling && !manual) toast(stopReason, "error");
   }
@@ -1854,10 +2158,81 @@ async function queryTask(taskId, manual = false) {
   renderTasks();
 }
 
+// 恢复一个被兜底停止的任务：重置计时与失败计数，重新开始轮询。
+// 这是一次全新的跟踪，所以 pollingSince 必须重设 —— 否则刚恢复就会撞上同一个超时阈值，
+// 用户点一下、界面闪一下又变回停止，等于按钮没用。
+function resumeStoppedTask(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task || !task.pollingStopped) return;
+  task.pollingStopped = false;
+  task.failures = 0;
+  task.pollingSince = Date.now();
+  task.status = "recovering";
+  task.message = "已恢复自动查询，正在向 ComfyUI 确认任务状态…";
+  persistTasks();
+  renderTasks();
+  startPolling(task.id, true);
+  toast("已恢复查询。", "success");
+}
+
+// 停止任务：把用户在任务中心点的那一个任务从 ComfyUI 侧真正停掉。
+// 排队中的会从队列移除，正在执行的会被中断；两者都不影响同队列里的其它任务。
+async function cancelTask(taskId, button = null) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task || isTaskTerminal(task)) return;
+  // 停止会丢弃已经算出来的部分，属于不可撤销操作，先确认一次（与「清空任务」的处理保持一致）。
+  const confirmed = window.confirm(
+    "停止这个任务？\n\n" +
+    "排队中的任务会从 ComfyUI 队列里移除；已经开始生成的任务会立即中断，本次生成作废。\n" +
+    "该操作只影响这一个任务，不会打断其它任务。"
+  );
+  if (!confirmed) return;
+
+  const originalText = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "停止中…";
+  }
+  try {
+    const result = await fetchJson(apiUrl("/api/cancel", task.comfyUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ promptId: task.id }),
+    }, 30000);
+
+    if (!result.stopped) {
+      // 任务已经不在 ComfyUI 队列里（可能刚好跑完，或 ComfyUI 重启过）。
+      // 这里**不伪造「已停止」**：只提示，并主动同步一次真实状态，避免界面与 ComfyUI 说法不一致。
+      toast(result.message || "该任务已不在 ComfyUI 队列中。", "error");
+      queryTask(task.id, true);
+      return;
+    }
+
+    stopPolling(task.id);
+    task.status = "cancelled";
+    task.finishedAt = Date.now();
+    task.elapsedMs = Math.max(0, task.finishedAt - Number(task.startedAt || task.createdAt || task.finishedAt));
+    task.message = result.message || "任务已停止。";
+    persistTasks();
+    renderTasks();
+    toast(task.message, "success");
+    // 队列可能因为这次停止而空出来，顺手走一遍「任务边界」显存清理（队列非空时服务端会自动跳过）。
+    cleanVramAfterTask(task.comfyUrl);
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    // 成功停止时卡片已经重绘、这个按钮已被换掉，isConnected 为 false，无需恢复。
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
 function startPolling(taskId, immediate = false) {
   stopPolling(taskId);
   const task = state.tasks.find((item) => item.id === taskId);
-  if (!task || ["success", "failed"].includes(task.status)) return;
+  if (!task || isTaskTerminal(task)) return;
   // 记录本次轮询的起点（只在首次进入轮询时记，后续 resume 不会重置），
   // 用于 MAX_POLL_DURATION_MS 的时长兜底。
   if (!task.pollingSince) task.pollingSince = Date.now();
@@ -1874,12 +2249,14 @@ function stopPolling(taskId) {
 
 // 判断某个仍在轮询的任务是否已经超过兜底阈值。
 // 返回 null 表示继续轮询；返回一段文字表示应当停止，文字用作提示。
+// 提示里点名的按钮必须是**任务卡片上**那个「恢复查询」：顶部的「重新查询」只处理仍在
+// 查询中的任务，对已经停下来的任务它什么也不做（还会提示"没有需要恢复查询的任务"）。
 function pollingStopReason(task) {
   if (task.pollingSince && Date.now() - task.pollingSince > MAX_POLL_DURATION_MS) {
-    return `已连续查询超过 ${Math.round(MAX_POLL_DURATION_MS / 3600000)} 小时仍未取得结果，工作站已停止自动查询。任务可能已在 ComfyUI 中结束或被取消，可点「刷新」手动再查一次。`;
+    return `已连续查询超过 ${Math.round(MAX_POLL_DURATION_MS / 3600000)} 小时仍未取得结果，工作站已停止自动查询。任务可能已在 ComfyUI 中结束或被取消，可点这张卡片上的「恢复查询」再试一次。`;
   }
   if ((task.failures || 0) >= MAX_QUERY_FAILURES) {
-    return `已连续 ${task.failures} 次无法查询 ComfyUI，工作站已停止自动查询。请确认 ComfyUI 仍在运行且地址正确，然后点「刷新」重试。`;
+    return `已连续 ${task.failures} 次无法查询 ComfyUI，工作站已停止自动查询。请确认 ComfyUI 仍在运行且地址正确，然后点这张卡片上的「恢复查询」重试。`;
   }
   return null;
 }
@@ -1921,7 +2298,11 @@ function ensureTaskVideo(card, task, output) {
 
 function buildTaskActions(content, task) {
   let actions = content.querySelector(".task-actions");
-  if (!task.outputs?.length && ["success", "failed"].includes(task.status)) {
+  const terminal = isTaskTerminal(task);
+  // 被兜底停止自动查询的任务即使没有输出，也要保留一个「恢复查询」入口，
+  // 否则它会永远钉在失败态、界面上一个按钮都没有。
+  const needsResume = terminal && Boolean(task.pollingStopped);
+  if (!task.outputs?.length && terminal && !needsResume) {
     actions?.remove();
     return;
   }
@@ -1940,12 +2321,25 @@ function buildTaskActions(content, task) {
     link.textContent = task.outputs.length > 1 ? `打开输出 ${index + 1}` : "打开 / 下载视频";
     actions.appendChild(link);
   });
-  if (!["success", "failed"].includes(task.status)) {
-    const retry = document.createElement("button");
-    retry.type = "button";
-    retry.textContent = "立即查询";
-    retry.addEventListener("click", () => queryTask(task.id, true));
-    actions.appendChild(retry);
+  if (!terminal) {
+    // 卡片上只留「停止任务」一个按钮。
+    // 【为什么不做「立即查询」】自动轮询本来就只有 5 秒一次，而性能监控面板那种秒级场景
+    // 才需要手动催一下；任务卡片上多一个"点了基本看不出变化"的按钮只会让人犹豫点哪个。
+    // 真要立刻催一次，标题栏的「重新查询」会对所有未结束任务一起催，够用了。
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "task-stop-button";
+    stop.textContent = "停止任务";
+    stop.addEventListener("click", () => cancelTask(task.id, stop));
+    actions.appendChild(stop);
+  } else if (needsResume) {
+    const resume = document.createElement("button");
+    resume.type = "button";
+    // 叫「恢复查询」而不是「重新查询」：标题栏那个「重新查询」只对**未结束**的任务催一次，
+    // 这个按钮是重置超时计时与失败计数、把自动轮询整个重新拉起来 —— 同名会让人以为是一回事。
+    resume.textContent = "恢复查询";
+    resume.addEventListener("click", () => resumeStoppedTask(task.id));
+    actions.appendChild(resume);
   }
 }
 
@@ -1962,7 +2356,7 @@ function updateTaskElapsedDisplays() {
   elements.taskList.querySelectorAll(".task-card[data-task-id]").forEach((card) => {
       const task = state.tasks.find((item) => String(item.id) === card.dataset.taskId);
     const elapsed = card.querySelector(".task-elapsed");
-    if (task && elapsed && !["success", "failed"].includes(task.status)) elapsed.textContent = `耗时 ${formatElapsed(task)}`;
+    if (task && elapsed && !isTaskTerminal(task)) elapsed.textContent = `耗时 ${formatElapsed(task)}`;
   });
 }
 
@@ -1972,7 +2366,7 @@ function updateTaskCard(card, task) {
   if (videoOutput) ensureTaskVideo(card, task, videoOutput);
   else card.querySelector("video[data-output-id]")?.remove();
 
-  const terminal = ["success", "failed"].includes(task.status);
+  const terminal = isTaskTerminal(task);
   let progress = card.querySelector(".progress-track");
   if (!progress) {
     progress = document.createElement("div");
@@ -1986,7 +2380,7 @@ function updateTaskCard(card, task) {
   progress.classList.toggle("indeterminate", progressValue == null);
   progressFill.style.width = progressValue == null ? "42%" : `${Math.max(0, Math.min(100, progressValue))}%`;
 
-  const labels = { queued: "等待中", running: "生成中", recovering: "状态恢复中", success: "已完成", failed: "生成失败" };
+  const labels = { queued: "等待中", running: "生成中", recovering: "状态恢复中", success: "已完成", failed: "生成失败", cancelled: "已停止" };
   const content = card.querySelector(".task-content");
   const taskModeLabels = { t2v: "文生", i2v: "图生", flf2v: "首尾帧", ref2va: "全能参考" };
   content.querySelector(".task-title-line strong").textContent = `${taskModeLabels[task.mode] || "视频"} · ${task.duration} 秒`;
@@ -2017,7 +2411,7 @@ function renderTasks() {
   // 兼容旧记录：已处于终结状态但没有固化耗时的任务只补算一次。
   let taskStorageChanged = false;
   state.tasks.forEach((task) => {
-    if (["success", "failed"].includes(task.status) && !Number.isFinite(Number(task.elapsedMs))) {
+    if (isTaskTerminal(task) && !Number.isFinite(Number(task.elapsedMs))) {
       const start = Number(task.startedAt || task.createdAt || task.finishedAt || Date.now());
       const end = Number(task.finishedAt || start);
       task.elapsedMs = Math.max(0, end - start);
@@ -2085,7 +2479,7 @@ function persistTasks() {
   // 丢弃「已结束」的任务（success/failed），活跃任务永不丢弃。
   // 只在确实超限时才裁剪，避免每次渲染都创建新数组。
   if (state.tasks.length > MAX_TASKS_IN_MEMORY) {
-    const isActive = (task) => !["success", "failed"].includes(task.status);
+    const isActive = (task) => !isTaskTerminal(task);
     let overflow = state.tasks.length - MAX_TASKS_IN_MEMORY;
     // 从尾部（最旧）往前找可丢弃的已结束任务
     for (let i = state.tasks.length - 1; i >= 0 && overflow > 0; i--) {
@@ -2109,7 +2503,7 @@ function startElapsedClock() {
 
 function clearCurrentTasks() {
   if (!state.tasks.length) return toast("当前没有可清空的任务记录。");
-  const activeCount = state.tasks.filter((task) => !["success", "failed"].includes(task.status)).length;
+  const activeCount = state.tasks.filter((task) => !isTaskTerminal(task)).length;
   const warning = activeCount
     ? `其中有 ${activeCount} 个任务仍在查询。清空只会移除本浏览器记录并停止查询，不会取消 ComfyUI 中正在生成的任务。确定继续吗？`
     : "确定清空当前浏览器中的全部生成记录吗？这不会删除 ComfyUI 输出文件。";
@@ -2330,7 +2724,7 @@ function loadStoredState() {
       }
       // 恢复时重置轮询起点与连续失败计数：
       // 页面重新打开相当于开启新一轮跟踪，不应继承上次会话的计时，否则会立刻触发超时兜底。
-      if (!["success", "failed"].includes(task.status)) {
+      if (!isTaskTerminal(task)) {
         task.pollingSince = Date.now();
         task.failures = 0;
       }
@@ -2338,7 +2732,7 @@ function loadStoredState() {
     }) : [];
   } catch { state.tasks = []; }
   renderTasks();
-  state.tasks.filter((task) => !["success", "failed"].includes(task.status)).forEach((task) => startPolling(task.id, true));
+  state.tasks.filter((task) => !isTaskTerminal(task)).forEach((task) => startPolling(task.id, true));
 }
 
 function setupDropZone(element, onFiles) {
@@ -2474,7 +2868,7 @@ function bindEvents() {
   });
   elements.generateButton.addEventListener("click", generate);
   elements.refreshTasksButton.addEventListener("click", () => {
-    const active = state.tasks.filter((task) => !["success", "failed"].includes(task.status));
+    const active = state.tasks.filter((task) => !isTaskTerminal(task));
     active.forEach((task) => queryTask(task.id, true));
     if (!active.length) toast("没有需要恢复查询的任务。");
   });
@@ -2484,8 +2878,16 @@ function bindEvents() {
   elements.applyUpdateButton.addEventListener("click", applyUpdate);
   elements.dismissUpdateButton.addEventListener("click", dismissUpdate);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) state.tasks.filter((task) => !["success", "failed"].includes(task.status)).forEach((task) => queryTask(task.id));
+    if (!document.hidden) state.tasks.filter((task) => !isTaskTerminal(task)).forEach((task) => queryTask(task.id));
+    // 性能监控：页面切到后台即停止轮询，切回且面板展开时恢复。
+    if (document.hidden) stopPerfPolling("hidden"); else startPerfPolling();
   });
+  // 性能监控面板：展开才开始轮询，收起立即停止（没人看的时候没必要刷）。
+  if (elements.perfPanel) {
+    elements.perfPanel.addEventListener("toggle", () => {
+      if (elements.perfPanel.open) startPerfPolling(); else stopPerfPolling("collapsed");
+    });
+  }
 }
 
 // 【能力探测并发去重】loadCapabilities 有三个触发点（页面加载时的 testConnection、用户点

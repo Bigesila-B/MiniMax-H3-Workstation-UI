@@ -1482,6 +1482,107 @@ function Clear-ComfyVram {
     if (-not $remote.Success) { throw "ComfyUI 清理显存失败（HTTP $($remote.StatusCode)）" }
 }
 
+function Get-ComfyQueueIds {
+    # 读取 ComfyUI 队列中「正在执行」与「排队等待」两组的 prompt_id。
+    # 【为什么要分开拿到这两组 id】停止任务必须先知道这个任务处在哪个状态：排队中的可以
+    # 直接从队列里删掉，正在执行的只能发中断；而「两组里都没有」说明它已经结束、已被取消
+    # 或 ComfyUI 重启过 —— 这种情况绝不能动手，否则会误伤此刻真正在跑的那个任务。
+    # 队列条目结构由 ComfyUI 固定为：[序号, prompt_id, prompt, extra_data, outputs_to_execute]。
+    param([string]$ComfyUrl)
+    $remote = Invoke-Comfy 'GET' "$ComfyUrl/queue"
+    if (-not $remote.Success) { throw "无法读取 ComfyUI 队列状态（HTTP $($remote.StatusCode)）" }
+    $queue = [Text.Encoding]::UTF8.GetString($remote.Bytes) | ConvertFrom-Json
+    # 用显式循环而不是管道展开：JSON 里的队列是「数组的数组」，
+    # 空队列或字段缺失时管道写法容易产出 $null 元素，显式循环的判断更直白。
+    $running = @()
+    $pending = @()
+    foreach ($item in @($queue.queue_running)) {
+        if ($item -and $item.Count -gt 1) { $running += [string]$item[1] }
+    }
+    foreach ($item in @($queue.queue_pending)) {
+        if ($item -and $item.Count -gt 1) { $pending += [string]$item[1] }
+    }
+    return [pscustomobject]@{ Running = $running; Pending = $pending }
+}
+
+function Stop-ComfyPrompt {
+    # 停止 ComfyUI 中的某一个任务（网页任务中心的「停止任务」）。
+    # 只操作调用方明确指定的 promptId，无论它排在哪个位置，都不会牵连同队列里的其它任务。
+    #
+    # 【为什么优先用 /api/jobs/{id}/cancel】ComfyUI 新版（master 0.39 起）提供了状态无关的
+    # 单任务取消接口：它内部用 interrupt_if_running() 在队列锁内原子地判断「这个 prompt 还
+    # 在不在跑」再发中断，从根上避免了「判断时在跑 → 真正发信号时已经跑完 → 中断落到下一个
+    # 任务头上」的串味；对已完成或未知的 id 也是幂等的（回 {"cancelled": false}，而非报错）。
+    # 本项目验证过的 0.34.5 不一定有这个路由，所以 404/405 时回退到手工两步走。
+    #
+    # 【回退路径为什么必须先读队列】不带 prompt_id 的 /interrupt 是**全局**中断（见 ComfyUI
+    # server.py 的 post_interrupt）：只要此刻真有任务在跑，一个全局中断就会把它打断。所以
+    # 回退路径必须先用 /queue 确认「正在执行的就是这一个」，才允许发中断 —— 此时全局中断
+    # 与定向中断等价，不会伤到别的任务。
+    param([string]$ComfyUrl, [string]$PromptId)
+
+    $jsonBody = [Text.Encoding]::UTF8.GetBytes((@{ prompt_id = $PromptId } | ConvertTo-Json -Compress))
+    $jobUrl = "$ComfyUrl/api/jobs/$([Uri]::EscapeDataString($PromptId))/cancel"
+    $cancel = Invoke-Comfy 'POST' $jobUrl $jsonBody 'application/json'
+
+    if ($cancel.StatusCode -eq 404 -or $cancel.StatusCode -eq 405) {
+        # 旧版 ComfyUI 没有这个路由，往下走手工回退。
+    } elseif ($cancel.Success) {
+        $cancelResult = [Text.Encoding]::UTF8.GetString($cancel.Bytes) | ConvertFrom-Json
+        if ($cancelResult.cancelled) {
+            return [pscustomobject]@{
+                Stopped = $true
+                Action  = 'cancelled'
+                Message = '已在 ComfyUI 中停止该任务。'
+            }
+        }
+        return [pscustomobject]@{
+            Stopped = $false
+            Action  = 'missing'
+            Message = '该任务已不在 ComfyUI 队列中（可能刚好生成完成、已被取消，或 ComfyUI 重启过）。'
+        }
+    } else {
+        throw "ComfyUI 拒绝停止任务（HTTP $($cancel.StatusCode)）。"
+    }
+
+    # —— 旧版回退：查队列 → 排队中则删除 → 再确认一次是否已开跑 → 是则中断 ——
+    $queueState = Get-ComfyQueueIds $ComfyUrl
+    # 【必须靠这个标志记住"删过"】删除成功之后要重读队列确认有没有开跑，而重读的结果里
+    # 这个 id **必然**已经不在 pending 里了 —— 如果再拿重读结果判断"是不是排队任务"，
+    # 刚删掉的任务会被判成"不在队列中"，向用户回报一个与事实相反的结论。
+    $removedFromQueue = $false
+    if ($queueState.Pending -contains $PromptId) {
+        $deleteBody = [Text.Encoding]::UTF8.GetBytes((@{ delete = @($PromptId) } | ConvertTo-Json -Compress))
+        $deleted = Invoke-Comfy 'POST' "$ComfyUrl/queue" $deleteBody 'application/json'
+        if (-not $deleted.Success) { throw "ComfyUI 拒绝移除排队任务（HTTP $($deleted.StatusCode)）。" }
+        # 「从队列删除」与「刚好被取出去执行」之间存在竞态窗口，删完再确认一次：
+        # 如果它已经开跑，删除是空操作，必须补一次中断，否则用户以为停了、实际还在跑。
+        $removedFromQueue = $true
+        $queueState = Get-ComfyQueueIds $ComfyUrl
+    }
+    if ($queueState.Running -contains $PromptId) {
+        $interrupt = Invoke-Comfy 'POST' "$ComfyUrl/interrupt" $jsonBody 'application/json'
+        if (-not $interrupt.Success) { throw "ComfyUI 拒绝中断任务（HTTP $($interrupt.StatusCode)）。" }
+        return [pscustomobject]@{
+            Stopped = $true
+            Action  = 'interrupted'
+            Message = '已中断正在执行的任务，本次生成作废。'
+        }
+    }
+    if ($removedFromQueue) {
+        return [pscustomobject]@{
+            Stopped = $true
+            Action  = 'deleted'
+            Message = '已从 ComfyUI 队列中移除，该任务不会再开始生成。'
+        }
+    }
+    return [pscustomobject]@{
+        Stopped = $false
+        Action  = 'missing'
+        Message = '该任务已不在 ComfyUI 队列中（可能刚好生成完成、已被取消，或 ComfyUI 重启过）。'
+    }
+}
+
 function Get-RtxScaleValue {
     # 放大倍数限制为 1-4 的整数（1 倍不改变分辨率、仅走 RTX 画质增强），异常输入回退默认 2 倍。
     param($RawValue)
@@ -2469,6 +2570,8 @@ function Get-UpdateInfo {
     $branch = if ([string]$config.'分支') { [string]$config.'分支' } else { 'main' }
     if ($branch -notmatch '^[A-Za-z0-9._\-/]+$') { return @{ configured = $false; reason = '「分支」名称不合法。' } }
 
+    $current = [string]$config.'当前版本'
+
     # ---- 优先按 Release tag 判断（根治「回填锚点」导致的永久误报）----
     # 锚点写在 更新配置.json 里，而“回填锚点”这个动作本身又会产生一个新提交：用 commit SHA
     # 比较的话，发布者的锚点永远比仓库 HEAD 少一个提交，检查更新必然误报（本项目真实踩坑：
@@ -2531,7 +2634,6 @@ function Get-UpdateInfo {
             if ($data.message) { throw "GitHub API：$($data.message)" }
             throw 'GitHub 未返回最新提交信息。'
         }
-        $current = [string]$config.'当前版本'
         $commitDate = [string]$data.commit.committer.date
         if (-not $commitDate) { $commitDate = [string]$data.commit.author.date }
         $commitMessage = ([string]$data.commit.message -split "`r?`n")[0].Trim()
@@ -2739,6 +2841,464 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);
     }
 } catch { $vtEnabled = $false }
 
+# ---------------------------------------------------------------------------
+# 性能监控快照（后台常驻采集）
+#
+# 供网页「性能监控」面板轮询（GET /api/system-stats），报告本机 CPU / 内存 /
+# 显卡占用与显卡温度。三条设计约束：
+#   1. **零第三方依赖**：只用 Windows 自带的性能计数器（PDH）与显卡驱动自带的
+#      nvidia-smi.exe。CPU 温度/功耗 Windows 没有系统级直读口（需 LibreHardwareMonitor
+#      等外部软件），不属于本面板范围。
+#   2. **只读诊断，绝不阻断生成**：采集失败的字段置 null 并把原因收进 errors，
+#      接口永远回 200 结构化结果（与环境自检同策略）；网页轮询失败也只是
+#      停止刷新，不影响任何生成流程。
+#   3. **不能拖慢主循环**：HTTP 主循环是单线程的，把采集放进去就会卡住 /api/progress
+#      等所有请求。所以采集整体搬到**后台 runspace**，接口只读内存快照。
+#
+# 【采集成本实测（2026-10-12，本机 i9-13900KF + RTX 4090），选型依据全在这】
+#   PerformanceCounter('Processor','% Processor Time','_Total')    0.68 ms/次
+#   Win32_PerfFormattedData_PerfOS_Processor                        304 ms/次  ← 弃用
+#   PerformanceCounter('Memory','Available Bytes')                  0.25 ms/次
+#   nvidia-smi 一次性调用                                            293 ms/次
+#   nvidia-smi -lms 500 常驻流（阻塞读下一行）                         0 ms/次
+#   结论：CPU/内存改用**常驻 PDH 计数器**、GPU 改用**常驻 nvidia-smi -lms 流**，
+#   一轮采集的实际开销约 1 毫秒。若沿用「每轮现场跑 WMI + 每轮新起一个 nvidia-smi」，
+#   一轮就是 600 毫秒，常驻采集会持续吃掉可观资源，也就没法做秒级刷新。
+#   —— 这两处是「能实时」的关键，改动前请先复测本表。
+# ---------------------------------------------------------------------------
+# 后台采集线程与 HTTP 线程之间只通过这一个**同步哈希表**交换数据：
+#   latest —— 采集线程每次采完把 { json = 快照JSON; at = 写入时刻 } 整体换掉，HTTP 线程只读；
+#   smiPid —— 采集线程拉起的常驻 nvidia-smi 进程号，服务退出时用于精确回收该子进程。
+# 快照用 JSON 字符串而不是对象，是为了彻底避开跨 runspace 的对象类型问题。
+$script:PerfShared = [hashtable]::Synchronized(@{
+    latest = $null
+    smiPid = 0
+})
+$script:PerfCollector = $null          # [powershell] 实例（采集线程宿主）
+$script:PerfCollectorAsync = $null     # BeginInvoke 返回的句柄
+# 快照超过这个年龄就认定采集线程没在工作，接口改走按需采集兜底。
+$script:PerfStaleSeconds = 10
+# nvidia-smi 的查询参数只在这里写一份，一次性调用与常驻流共用，避免两处走样。
+$script:PerfSmiArgs = '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits'
+
+# nvidia-smi 路径探测缓存：$false 表示"本机没有"，避免每次轮询都去摸文件系统。
+# 找不到的结果只缓存 5 分钟 —— 用户装好驱动后无需重启服务就能看到显卡数据。
+$script:NvidiaSmiPath = $null
+$script:NvidiaSmiProbedAt = [DateTime]::MinValue
+
+function Find-NvidiaSmi {
+    param([TimeSpan]$NegativeTtl)
+    if ($null -ne $script:NvidiaSmiPath) { return $script:NvidiaSmiPath }
+    if ((Get-Date) - $script:NvidiaSmiProbedAt -lt $NegativeTtl) { return $false }
+    $script:NvidiaSmiProbedAt = Get-Date
+    # 新版驱动把 nvidia-smi 装进 System32；旧版在 Program Files\NVIDIA Corporation\NVSMI。
+    $candidates = @(
+        (Join-Path $env:SystemRoot 'System32\nvidia-smi.exe'),
+        (Join-Path ${env:ProgramFiles} 'NVIDIA Corporation\NVSMI\nvidia-smi.exe')
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate -PathType Leaf) {
+            $script:NvidiaSmiPath = $candidate
+            return $candidate
+        }
+    }
+    $script:NvidiaSmiPath = $false
+    return $false
+}
+
+function Invoke-NvidiaSmi {
+    # 带超时看门狗地调用 nvidia-smi。ReadToEndAsync 必须在 WaitForExit 之前发起，
+    # 否则输出缓冲区写满时子进程会被管道背压卡死，WaitForExit 永远等不到退出。
+    param([string]$ExePath, [int]$TimeoutMs = 3000)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ExePath
+    # 固定参数、无任何用户输入，不存在注入面。
+    # 参数文本与后台采集线程共用 $script:PerfSmiArgs（在下面作为实参传进采集脚本），
+    # 两处一旦走样，就会出现"接口显示的列和采集线程解析的列不一致"这种极难排查的问题。
+    $psi.Arguments = $script:PerfSmiArgs
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $readTask = $process.StandardOutput.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            try { $process.Kill() } catch {}
+            throw 'nvidia-smi 响应超时（显卡驱动可能正忙）。'
+        }
+        return $readTask.Result
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Get-GpuSnapshot {
+    # 返回 @{ gpus = [...]; error = $null | '...' }，普通 PowerShell 对象数组，调用方负责拼快照。
+    $gpus = @()
+    $smiPath = Find-NvidiaSmi -NegativeTtl ([TimeSpan]::FromMinutes(5))
+    if ($smiPath) {
+        try {
+            $text = Invoke-NvidiaSmi -ExePath $smiPath
+            foreach ($line in ($text -split "`r?`n" | Where-Object { $_.Trim() })) {
+                $cols = $line.Split(',') | ForEach-Object { $_.Trim() }
+                # CSV 列：index, name, util%, memUsed(MB), memTotal(MB), temp(C), power(W)
+                if ($cols.Count -lt 7) { continue }
+                $parse = { param($v) $n = 0.0; if ($v -match '^[0-9]+(\.[0-9]+)?$' -and [double]::TryParse($v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { [Math]::Round($n, 1) } else { $null } }
+                $gpus += [ordered]@{
+                    source              = 'nvidia-smi'
+                    name                = [string]$cols[1]
+                    utilizationPercent  = & $parse $cols[2]
+                    memoryUsedMb        = & $parse $cols[3]
+                    memoryTotalMb       = & $parse $cols[4]
+                    temperatureC        = & $parse $cols[5]
+                    powerW              = & $parse $cols[6]
+                }
+            }
+        } catch {
+            return @{ gpus = $gpus; error = "NVIDIA 显卡数据读取失败：$($_.Exception.Message)" }
+        }
+        if ($gpus.Count) { return @{ gpus = $gpus; error = $null } }
+    }
+    # 没有 nvidia-smi（非 NVIDIA 显卡 / 未装驱动）时的兜底：只报显卡型号，
+    # 不冒充占用数据 —— Win32_VideoController 给不出利用率与温度，宁可留空。
+    try {
+        foreach ($adapter in (Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)) {
+            if (-not $adapter.Name) { continue }
+            $gpus += [ordered]@{
+                source              = 'wmi'
+                name                = [string]$adapter.Name
+                utilizationPercent  = $null
+                memoryUsedMb        = $null
+                memoryTotalMb       = $null
+                temperatureC        = $null
+                powerW              = $null
+            }
+        }
+    } catch {
+        return @{ gpus = $gpus; error = "显卡信息读取失败：$($_.Exception.Message)" }
+    }
+    return @{ gpus = $gpus; error = $null }
+}
+
+# ---------------------------------------------------------------------------
+# 后台采集线程本体
+#
+# 【为什么长这样】这段脚本在**独立 runspace** 里跑，拿不到本文件的任何函数与变量
+# （Find-NvidiaSmi / Invoke-NvidiaSmi / Get-GpuSnapshot 全都用不了），所以 nvidia-smi
+# 的路径与参数由调用方以实参传进来，采集逻辑必须自包含。
+# 节奏由常驻 nvidia-smi 的输出行驱动（约 500ms 一行，阻塞读即可），
+# 没有 nvidia-smi 时退化为定时 sleep —— 两种情况下**一轮的实际开销都是毫秒级**。
+# ---------------------------------------------------------------------------
+$script:PerfCollectorBody = {
+    param($shared, $smiPath, $smiArgs)
+
+    $ErrorActionPreference = 'Continue'
+    $intervalMs = 500
+
+    # ---- 静态信息：只读一次（WMI 查询约 0.3~1 秒，不能放进每轮循环）----
+    $cpuName = ''
+    $logicalCores = [Environment]::ProcessorCount
+    $totalKb = 0.0
+    $staticErrors = @()
+    try {
+        $procs = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+        if ($procs.Count -gt 0) {
+            $cpuName = [string]$procs[0].Name
+            $coreSum = ($procs | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+            if ($coreSum) { $logicalCores = [int]$coreSum }
+        }
+    } catch {
+        $staticErrors += "CPU 信息读取失败：$($_.Exception.Message)"
+    }
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $totalKb = [double]$os.TotalVisibleMemorySize
+    } catch {
+        $staticErrors += "内存总量读取失败：$($_.Exception.Message)"
+    }
+
+    # ---- 常驻性能计数器：一次创建，之后每轮只读一个值（0.2~0.7 毫秒）----
+    $cpuCounter = $null
+    $memCounter = $null
+    try {
+        $cpuCounter = New-Object System.Diagnostics.PerformanceCounter('Processor', '% Processor Time', '_Total')
+        # 计数器首值不可信（没有上一帧可比较），先读一次建立基线再丢弃。
+        $null = $cpuCounter.NextValue()
+    } catch {
+        $staticErrors += "CPU 计数器初始化失败：$($_.Exception.Message)"
+        $cpuCounter = $null
+    }
+    try {
+        $memCounter = New-Object System.Diagnostics.PerformanceCounter('Memory', 'Available Bytes')
+        $null = $memCounter.NextValue()
+    } catch {
+        $staticErrors += "内存计数器初始化失败：$($_.Exception.Message)"
+        $memCounter = $null
+    }
+
+    $parseNumber = {
+        param($value)
+        $n = 0.0
+        if ($value -match '^[0-9]+(\.[0-9]+)?$' -and [double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) {
+            return [Math]::Round($n, 1)
+        }
+        return $null
+    }
+
+    # ---- 没有 nvidia-smi 时的显卡兜底：只报型号，也只在启动时查一次 ----
+    $lastGpus = @()
+    if (-not $smiPath) {
+        try {
+            foreach ($adapter in (Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)) {
+                if (-not $adapter.Name) { continue }
+                $lastGpus += [ordered]@{
+                    source             = 'wmi'
+                    name               = [string]$adapter.Name
+                    utilizationPercent = $null
+                    memoryUsedMb       = $null
+                    memoryTotalMb      = $null
+                    temperatureC       = $null
+                    powerW             = $null
+                }
+            }
+        } catch {
+            $staticErrors += "显卡信息读取失败：$($_.Exception.Message)"
+        }
+    }
+
+    $smiProcess = $null
+    $smiFailures = 0
+    $streamBroken = -not $smiPath
+    $streamNote = '未检测到 NVIDIA 显卡工具（nvidia-smi），显卡只报型号。'
+    if ($smiPath) { $streamNote = '' }
+
+    while ($true) {
+        $gpuLine = $null
+
+        if ($streamBroken) {
+            Start-Sleep -Milliseconds $intervalMs
+        } else {
+            if ($null -eq $smiProcess) {
+                try {
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = $smiPath
+                    $psi.Arguments = "$smiArgs -lms $intervalMs"
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $smiProcess = [System.Diagnostics.Process]::Start($psi)
+                    # 把进程号记到共享状态里：nvidia-smi 是**子进程**，不会随本服务退出而消失，
+                    # Stop-PerfCollector 需要靠这个"精确的号码"在关服务时把它收掉
+                    # （绝不按进程名批量杀 —— 那会误伤用户自己执行的 nvidia-smi 查询）。
+                    $shared.smiPid = $smiProcess.Id
+                } catch {
+                    $smiProcess = $null
+                    $streamBroken = $true
+                    $streamNote = "nvidia-smi 常驻进程启动失败，已退化为定时采集：$($_.Exception.Message)"
+                }
+            }
+            if ($null -ne $smiProcess) {
+                try {
+                    $readTask = $smiProcess.StandardOutput.ReadLineAsync()
+                    # 3 秒看门狗：显卡驱动忙等时 ReadLine 会一直堵着，不能让采集线程无声停摆。
+                    if ($readTask.Wait(3000)) { $gpuLine = $readTask.Result }
+                } catch {
+                    $gpuLine = $null
+                }
+                if ([string]::IsNullOrWhiteSpace($gpuLine)) {
+                    # 进程退出或读取超时：销毁它，下一轮重新拉起；连续三次就彻底放弃流模式。
+                    try { $smiProcess.Kill() } catch {}
+                    try { $smiProcess.Dispose() } catch {}
+                    $smiProcess = $null
+                    $shared.smiPid = 0
+                    $smiFailures++
+                    if ($smiFailures -ge 3) {
+                        $streamBroken = $true
+                        $streamNote = 'nvidia-smi 流式读取连续失败，已退化为定时采集。'
+                    }
+                    Start-Sleep -Milliseconds 200
+                }
+            }
+        }
+
+        # ---- 一轮采样 ----
+        $errors = @($staticErrors)
+
+        $cpuPercent = $null
+        if ($cpuCounter) {
+            try { $cpuPercent = [Math]::Round([double]$cpuCounter.NextValue(), 0) }
+            catch { $errors += "CPU 占用读取失败：$($_.Exception.Message)"; $cpuCounter = $null }
+        }
+
+        $totalGb = $null
+        $usedGb = $null
+        $usedPercent = $null
+        if ($totalKb -gt 0) {
+            $totalGb = [Math]::Round($totalKb / 1MB, 1)
+            $availableKb = $null
+            if ($memCounter) {
+                try { $availableKb = [double]$memCounter.NextValue() / 1KB }
+                catch { $errors += "内存占用读取失败：$($_.Exception.Message)"; $memCounter = $null }
+            }
+            if ($null -ne $availableKb) {
+                $usedKb = [Math]::Max(0, $totalKb - $availableKb)
+                $usedGb = [Math]::Round($usedKb / 1MB, 1)
+                $usedPercent = [Math]::Round($usedKb / $totalKb * 100, 1)
+            }
+        }
+
+        $gpus = @()
+        if ($null -ne $gpuLine) {
+            # CSV 列：index, name, util%, memUsed(MB), memTotal(MB), temp(C), power(W)
+            $cols = @($gpuLine.Split(',') | ForEach-Object { $_.Trim() })
+            if ($cols.Count -ge 7) {
+                $gpus += [ordered]@{
+                    source             = 'nvidia-smi'
+                    name               = [string]$cols[1]
+                    utilizationPercent = & $parseNumber $cols[2]
+                    memoryUsedMb       = & $parseNumber $cols[3]
+                    memoryTotalMb      = & $parseNumber $cols[4]
+                    temperatureC       = & $parseNumber $cols[5]
+                    powerW             = & $parseNumber $cols[6]
+                }
+            }
+        }
+        # 本轮没读到显卡数据（例如流刚被重启）时沿用上一次的值，避免面板数字闪烁归零。
+        if ($gpus.Count -eq 0) { $gpus = @($lastGpus) } else { $lastGpus = $gpus }
+
+        $mode = 'timer'
+        if (-not $streamBroken) { $mode = 'stream' }
+
+        $snapshot = [ordered]@{
+            timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            cpu       = [ordered]@{ name = $cpuName; loadPercent = $cpuPercent; logicalCores = $logicalCores }
+            memory    = [ordered]@{ totalGb = $totalGb; usedGb = $usedGb; usedPercent = $usedPercent }
+            gpus      = @($gpus)
+            errors    = @($errors)
+            collector = [ordered]@{ mode = $mode; fresh = $true; note = $streamNote }
+        }
+
+        # 把「数据 + 时刻 + 状态」作为**一个对象**整体发布：HTTP 线程读到的永远是自洽的一份，
+        # 不会出现"新数据配旧时刻"这种半新半旧的中间态（分两次写就会有这个缝）。
+        $shared.latest = @{
+            json = ($snapshot | ConvertTo-Json -Depth 6 -Compress)
+            at   = (Get-Date)
+        }
+    }
+}
+
+function Start-PerfCollector {
+    # 启动常驻采集线程。失败不影响服务：Get-SystemPerformanceSnapshot 会退回按需采集。
+    if ($script:PerfCollector) { return }
+    $smiPath = Find-NvidiaSmi -NegativeTtl ([TimeSpan]::FromMinutes(5))
+    if (-not $smiPath) { $smiPath = $null }
+    try {
+        # 显式建一个**独占 runspace**：不这么做，BeginInvoke 每次调用会自己开临时 runspace，
+        # 这个无限循环就会把临时 runspace 永远占住，行为难以预料。
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.Open()
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+        $null = $shell.AddScript($script:PerfCollectorBody.ToString())
+        $null = $shell.AddArgument($script:PerfShared)
+        $null = $shell.AddArgument($smiPath)
+        $null = $shell.AddArgument($script:PerfSmiArgs)
+        $script:PerfCollector = $shell
+        # 无限循环的脚本永远不会"跑完"，BeginInvoke 只是把它丢到后台线程上。
+        $script:PerfCollectorAsync = $shell.BeginInvoke()
+        Write-Host "  [性能监控] 后台采集线程已启动（CPU/内存走常驻计数器，显卡走 nvidia-smi 常驻流）。" -ForegroundColor DarkCyan
+    } catch {
+        $script:PerfCollector = $null
+        $script:PerfCollectorAsync = $null
+        Write-Host "  [提示] 性能监控后台采集线程启动失败，已退化为按需采集：$($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+function Stop-PerfCollector {
+    $shell = $script:PerfCollector
+    if ($shell) {
+        try { $shell.Stop() } catch {}
+        try { if ($shell.Runspace) { $shell.Runspace.Dispose() } } catch {}
+        try { $shell.Dispose() } catch {}
+    }
+    $script:PerfCollector = $null
+    $script:PerfCollectorAsync = $null
+    # 收掉采集线程拉起的常驻 nvidia-smi。它跑在别的 runspace 里、我们又没法直接拿到它的
+    # 进程对象，所以靠采集线程写下的进程号精确地杀 —— 并且核对进程名，
+    # 避免号码被系统回收后被我们误杀成别的进程。
+    $smiPid = 0
+    try { $smiPid = [int]$script:PerfShared.smiPid } catch {}
+    if ($smiPid -gt 0) {
+        try {
+            $child = Get-Process -Id $smiPid -ErrorAction Stop
+            if ($child.ProcessName -eq 'nvidia-smi') { $child.Kill() }
+        } catch {}
+        $script:PerfShared.smiPid = 0
+    }
+}
+
+function Get-SystemPerformanceOnDemandJson {
+    # 兜底路径：现场采集（约 0.6 秒，而且跑在单线程 HTTP 主循环里）。
+    # 只有后台采集线程没产出第一份数据、或快照已明显过期时才会走到这里。
+    $now = Get-Date
+    $errors = @()
+    # ---- CPU（占用）----
+    $cpu = [ordered]@{ name = ''; loadPercent = $null; logicalCores = $null }
+    try {
+        $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+        if ($processors.Count) {
+            $cpu.name = [string]$processors[0].Name
+            # LoadPercentage 每颗 CPU 一个值，多路平台取平均。
+            $loads = @($processors | ForEach-Object { if ($null -ne $_.LoadPercentage) { [double]$_.LoadPercentage } })
+            if ($loads.Count) { $cpu.loadPercent = [Math]::Round(($loads | Measure-Object -Average).Average, 0) }
+            $cpu.logicalCores = ($processors | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+        }
+    } catch {
+        $errors += "CPU 信息读取失败：$($_.Exception.Message)"
+    }
+    # ---- 内存 ----
+    $memory = [ordered]@{ totalGb = $null; usedGb = $null; usedPercent = $null }
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $totalKb = [double]$os.TotalVisibleMemorySize
+        $freeKb = [double]$os.FreePhysicalMemory
+        if ($totalKb -gt 0) {
+            $memory.totalGb = [Math]::Round($totalKb / 1MB, 1)
+            $memory.usedGb = [Math]::Round(($totalKb - $freeKb) / 1MB, 1)
+            $memory.usedPercent = [Math]::Round(($totalKb - $freeKb) / $totalKb * 100, 1)
+        }
+    } catch {
+        $errors += "内存信息读取失败：$($_.Exception.Message)"
+    }
+    # ---- 显卡 ----
+    $gpuResult = Get-GpuSnapshot
+    if ($gpuResult.error) { $errors += $gpuResult.error }
+
+    $snapshot = [ordered]@{
+        timestamp = $now.ToString('yyyy-MM-dd HH:mm:ss')
+        cpu       = $cpu
+        memory    = $memory
+        gpus      = @($gpuResult.gpus)
+        errors    = @($errors)
+        # fresh=$false 让网页把"采集线程没在工作"如实告诉用户，而不是让人以为面板坏了。
+        collector = [ordered]@{ mode = 'ondemand'; fresh = $false; note = '后台采集线程未在运行，本次为按需采集，刷新会明显变慢。' }
+    }
+    return ($snapshot | ConvertTo-Json -Depth 6 -Compress)
+}
+
+function Get-SystemPerformanceSnapshot {
+    # HTTP 线程的唯一入口：优先返回后台采集线程发布的那份快照（微秒级）。
+    # 只有快照缺失或已明显过期时才现场采集兜底 —— 宁可这一次慢一点，
+    # 也不要让面板空着或永远停在旧数据上（与"绝不阻断"同策略）。
+    $latest = $script:PerfShared.latest
+    if ($latest -and ((Get-Date) - $latest.at).TotalSeconds -lt $script:PerfStaleSeconds) {
+        return $latest.json
+    }
+    return (Get-SystemPerformanceOnDemandJson)
+}
+
 function Write-ConsoleLink {
     param([string]$Label, [string]$Url, [string]$Note, [string]$Hotkey = '')
     $suffix = if ($Note) { "  $Note" } else { '' }
@@ -2844,13 +3404,21 @@ $script:StaticExtensions = @('.html', '.js', '.css', '.svg', '.png', '.jpg', '.j
 # 让控制台窗口始终有固定标题，更新助手重启服务后标题保持一致，方便用户按说明关闭服务。
 try { $Host.UI.RawUI.WindowTitle = 'MiniMax H3 工作站服务' } catch {}
 
+# 性能监控的后台采集线程：进主循环之前拉起来，此后由它按固定节奏刷新内存快照，
+# /api/system-stats 只读快照。即使这一步失败，接口也会退回按需采集，不影响任何功能。
+Start-PerfCollector
+
+. (Join-Path $root "lora-library.ps1")
+
 while ($listener.IsListening -and -not $script:UpdateRestartPending) {
     $ctx = $listener.GetContext()
+    $script:LoraResponseDetached = $false
     try {
         $path = $ctx.Request.Url.AbsolutePath
         $method = $ctx.Request.HttpMethod.ToUpperInvariant()
 
-        if ($path -eq '/api/ai-config' -and $method -eq 'GET') {
+        if (Invoke-LoraLibraryRoute $ctx $path $method) { }
+        elseif ($path -eq '/api/ai-config' -and $method -eq 'GET') {
             $config = Get-AiPromptConfig
             $models = @($config.'模型') | ForEach-Object { [pscustomobject]@{ id = [string]$_.id; supportsImages = [bool]$_.supports_images } }
             $templates = @($config.'提示词模板') | ForEach-Object {
@@ -2900,6 +3468,26 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
                 Write-Host "  [显存] ComfyUI 队列空闲，已卸载模型并释放显存。" -ForegroundColor DarkCyan
                 Send-Json $ctx @{ ok = $true; message = '显存已清理：模型已从显存卸载。' }
             }
+        }
+        elseif ($path -eq '/api/cancel' -and $method -eq 'POST') {
+            # 停止任务：把用户指定的一项已提交任务从 ComfyUI 侧真正停掉（排队中的移除、
+            # 正在执行的立即中断）。与 /api/free 同一套闸门 —— 只允许 POST + 同源校验：
+            # 若同时接受 GET，任何网页只要放一个 <img src="http://127.0.0.1:8000/api/cancel?promptId=…">
+            # 就能跨站把用户正在跑的生成打断。
+            Assert-SameOrigin $ctx.Request
+            Assert-RequestSize $ctx.Request 65536 '停止任务请求过大。'
+            $bodyBytes = Read-RequestBytes $ctx.Request
+            if ($bodyBytes.Length -gt 65536) { throw '停止任务请求过大。' }
+            $bodyObject = [Text.Encoding]::UTF8.GetString($bodyBytes) | ConvertFrom-Json
+            $promptId = [string]$bodyObject.promptId
+            # prompt_id 由 ComfyUI 生成为 UUID，只可能是字母数字与连字符。这条校验是硬护栏：
+            # 它既挡住空值与超长垃圾，又保证下面拼进上游 URL / 请求体的是纯安全字符。
+            if ($promptId -notmatch '^[0-9a-zA-Z_-]{1,64}$') { throw '任务编号不合法，无法停止。' }
+            $comfy = Get-ComfyUrl $ctx.Request $bodyObject
+            $result = Stop-ComfyPrompt $comfy $promptId
+            # stopped=false 不当作错误（任务可能刚好跑完），由网页决定后续如何显示；
+            # 这里永远回 200 结构化结果，避免用户点一下停止却弹一个红叉。
+            Send-Json $ctx @{ ok = $true; stopped = $result.Stopped; action = $result.Action; message = $result.Message }
         }
         elseif ($path -eq '/api/check-update' -and $method -eq 'GET') {
             $fresh = ([string]$ctx.Request.QueryString['fresh'] -eq '1')
@@ -3036,6 +3624,13 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
                     error     = $_.Exception.Message
                 })
             }
+        }
+        elseif ($path -eq '/api/system-stats' -and $method -eq 'GET') {
+            # 只读性能快照：本机 CPU / 内存 / 显卡占用与显卡温度，供网页「性能监控」面板轮询。
+            # 刻意不抛 5xx（与环境自检同策略）：个别字段读不到就在 errors 里说明，其余照常返回。
+            # 数据来自后台常驻采集线程，这里只是读内存快照，因此可以撑住秒级刷新；
+            # 快照缺失或过期时函数内部会退回按需采集，接口永远有数据。
+            Send-Json $ctx (Get-SystemPerformanceSnapshot)
         }
         elseif ($path -eq '/api/install-package' -and $method -eq 'POST') {
             # 一键安装缺失的节点包：转发给 ComfyUI-Manager 的 POST /customnode/install/git_url
@@ -3192,9 +3787,13 @@ while ($listener.IsListening -and -not $script:UpdateRestartPending) {
     } catch {
         try { Send-Error $ctx $_.Exception.Message 500 } catch {}
     } finally {
-        try { $ctx.Response.Close() } catch {}
+        if (-not $script:LoraResponseDetached) { try { $ctx.Response.Close() } catch {} }
     }
 }
+
+# 退出前把后台采集线程连同它的 runspace 一起收掉，避免进程退出时留下残留线程。
+Stop-PerfCollector
+foreach ($stream in $script:LoraStreams) { try { $stream.job.Stop(); $stream.job.Dispose() } catch {} }
 
 try { $listener.Stop() } catch {}
 if ($script:UpdateRestartPending) {

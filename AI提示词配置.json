@@ -7,11 +7,11 @@
     "retry_count 控制 AI 服务返回 429/500/502/503/504 时的重试次数。fallback_to_text_on_image_error 为 true 时，视觉请求持续失败会自动改用纯文字再试一次。",
     "请不要把包含真实 API Key 的本文件上传到公网。"
   ],
-  "默认模型": "agnes-2.5-flash",
+  "默认模型": "agnes-3.0-flash",
   "默认模板": "官方视频提示词",
   "模型": [
     {
-      "id": "agnes-2.5-flash",
+      "id": "agnes-3.0-flash",
       "url": "https://api.agnes-ai.cn/v1",
       "api_key": "",
       "supports_images": true,
@@ -22,17 +22,8 @@
       "fallback_to_text_on_image_error": true
     },
     {
-      "id": "grok-4.6",
+     "id": "grok-4.6",
       "url": "https://faroapi.com/v1",
-      "api_key": "",
-      "supports_images": true,
-      "temperature": 0.7,
-      "max_tokens": 16384,
-      "timeout_seconds": 180
-    },
-    {
-      "id": "step-3.7-flash",
-      "url": "https://api.stepfun.com/step_plan/v1",
       "api_key": "",
       "supports_images": true,
       "temperature": 0.7,
@@ -48,7 +39,7 @@
       "max_tokens": 16384,
       "timeout_seconds": 180
     }
-  ],
+   ],
   "提示词模板": [
     {
       "id": "官方视频提示词",

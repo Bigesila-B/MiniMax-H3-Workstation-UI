@@ -6,8 +6,9 @@
   <meta name="theme-color" content="#f6f7f9">
   <meta name="description" content="使用本地 ComfyUI 与当前目录加速工作流的 MiniMax H3 视频工作站">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/assets/workstation.css?v=20260921-13">
+  <link rel="stylesheet" href="/assets/workstation.css?v=20261012-7">
   <title>MiniMax H3 视频工作站</title>
+  <link rel="stylesheet" href="/assets/lora-library.css?v=20261012-7">
 </head>
 <body>
   <div class="app-shell">
@@ -250,13 +251,14 @@
               </label>
             </div>
 
-            <div class="subsection-heading">
-              <div>
-                <h3>LoRA 配置</h3>
-                <p>普通模式与全能参考模式使用各自默认的 Turbo LoRA，也可扫描并添加本地 LoRA。</p>
-              </div>
-              <button class="button secondary small-button" id="addLoraButton" type="button">添加 LoRA</button>
-            </div>
+            <details class="ll-library-disclosure" id="loraLibraryPanel">
+              <summary aria-controls="loraLibrary">
+                <span class="ll-library-title">LoRA 模型库<span class="ll-header-count" id="loraLibraryCount">尚未扫描</span></span>
+                <span class="ll-library-toggle" id="loraLibraryToggle">展开模型库</span>
+              </summary>
+              <div id="loraLibrary"></div>
+            </details>
+            <div class="ll-active-heading"><div><h4>本次生成已选 LoRA</h4><p>支持多项叠加；启停与强度只影响生成配置。手动修改后，切换模式会保留当前列表。</p></div><button class="button secondary small-button" id="addLoraButton" type="button">添加配置行</button></div>
             <div class="lora-list" id="loraList"></div>
             <p class="empty-hint hidden" id="loraEmpty">当前未启用 LoRA。TE-Speed 仍会运行，但可能失去工作流默认的 Turbo LoRA 加速效果。</p>
           </div>
@@ -419,11 +421,21 @@
           <ul class="self-check-modes" id="selfCheckModes"></ul>
           <div class="self-check-packages" id="selfCheckPackages"></div>
         </section>
+
+        <details class="panel collapsible-panel perf-panel" id="perfPanel">
+          <summary>
+            <span><span class="eyebrow">性能监控</span><strong>CPU · 内存 · 显卡</strong></span>
+            <span class="summary-note" id="perfSummaryNote">展开后自动刷新</span>
+          </summary>
+          <div class="details-content perf-content">
+            <div class="perf-grid" id="perfGrid"></div>
+          </div>
+        </details>
       </aside>
     </main>
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
-  <script type="module" src="/assets/workstation.js?v=20260921-13"></script>
+  <script type="module" src="/assets/workstation.js?v=20261012-7"></script>
 </body>
 </html>

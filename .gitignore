@@ -3,7 +3,7 @@
 Thumbs.db
 Desktop.ini
 
-# 忽略本地/拟提交的敏感配置（仓库内保留 AI提示词配置.example.json 空 Key 模板）
+# 本地配置默认忽略；发行时只显式提交已清空 Key 的 AI提示词配置.json
 AI提示词配置.json
 AI提示词配置*.local.json
 AI提示词配置*.secret.json
@@ -26,3 +26,6 @@ tmp/
 代码审查报告*.md
 # 本地开发文档（含节点 ID 对照表与本地环境信息，默认不分发）
 开发文档*.md
+
+# LoRA library metadata, uploaded previews and recoverable deleted models
+.lora-library/
