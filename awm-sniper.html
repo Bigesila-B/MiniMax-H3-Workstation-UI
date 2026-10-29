@@ -325,16 +325,16 @@ const matDark = new THREE.MeshStandardMaterial({
   color: 0x050607, metalness: 0.2, roughness: 0.92, envMapIntensity: 0.35
 });
 const matPolymer = new THREE.MeshPhysicalMaterial({
-  color: 0x333c2c, metalness: 0.0, roughness: 0.60,
+  color: 0x333c2c, metalness: 0.0, roughness: 0.86,
   bumpMap: polymerGrainTex, bumpScale: 0.0015,
-  clearcoat: 0.30, clearcoatRoughness: 0.50, sheen: 0.16,
+  clearcoat: 0.06, clearcoatRoughness: 0.75, sheen: 0.06,
   sheenColor: new THREE.Color(0x8d9a76), sheenRoughness: 0.92,
-  envMapIntensity: 0.62
+  envMapIntensity: 0.45
 });
 const matPolymerDark = new THREE.MeshPhysicalMaterial({
-  color: 0x2c342a, metalness: 0.0, roughness: 0.58,
+  color: 0x2c342a, metalness: 0.0, roughness: 0.84,
   bumpMap: polymerGrainTex, bumpScale: 0.0015,
-  clearcoat: 0.32, clearcoatRoughness: 0.50, envMapIntensity: 0.62
+  clearcoat: 0.08, clearcoatRoughness: 0.75, envMapIntensity: 0.45
 });
 const matRubber = new THREE.MeshPhysicalMaterial({
   color: 0x0c0d0e, metalness: 0.0, roughness: 0.94,
